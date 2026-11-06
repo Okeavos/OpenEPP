@@ -5,6 +5,7 @@
 #include "agent/agent.h"
 #include "agent/detection_store.h"
 #include "agent/realtime.h"
+#include "behavior/alert_store.h"
 #include "common/config.h"
 #include "common/log.h"
 #include "common/util.h"
@@ -19,6 +20,10 @@ namespace {
 std::unique_ptr<sec::Agent> g_agent;
 std::unique_ptr<sec::DetectionStore> g_store;
 std::unique_ptr<sec::RealtimeScanner> g_realtime;
+std::unique_ptr<sec::behavior::AlertFeed> g_feed;
+sec::behavior::SensorStatus g_sensor;
+bool g_sensor_fresh = false;
+std::filesystem::path g_behavior_dir;
 sec::FsMonitor g_monitor;
 sec::AgentConfig g_config;
 bool g_monitor_ok = false;
@@ -51,6 +56,40 @@ NSString* local_time(const std::string& iso) {
     return [out stringFromDate:date];
 }
 
+NSString* local_time_ms(std::int64_t ms) {
+    NSDate* date = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)ms / 1000.0];
+    NSDateFormatter* out = [[NSDateFormatter alloc] init];
+    out.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    return [out stringFromDate:date];
+}
+
+NSString* level_label(int level) { return level >= 2 ? @"심각" : @"경고"; }
+
+NSString* joined(const std::vector<std::string>& items, NSString* sep) {
+    NSMutableArray* parts = [NSMutableArray array];
+    for (const auto& i : items) [parts addObject:ns(i)];
+    return [parts componentsJoinedByString:sep];
+}
+
+NSString* sensor_line() {
+    if (!g_sensor_fresh) return @"행위 센서: 꺼짐 (sudo packaging/macos/install_sensord.sh)";
+    NSString* line = nil;
+    if (g_sensor.eslogger == "running") {
+        line = @"행위 센서: 동작 중";
+    } else if (g_sensor.eslogger == "starting") {
+        line = @"행위 센서: 시작 중…";
+    } else if (g_sensor.eslogger == "failed") {
+        std::string err = g_sensor.last_error;
+        if (err.size() > 90) err = err.substr(0, 90) + "…";
+        line = [NSString stringWithFormat:@"⚠ 행위 센서: eslogger 오류 — %@", ns(err)];
+    } else {
+        line = @"행위 센서: 동작 중 (eslogger 꺼짐)";
+    }
+    if (g_sensor.sockets == "failed") line = [line stringByAppendingString:@" · 소켓 감시 실패"];
+    if (!g_sensor.rules_error.empty()) line = [line stringByAppendingString:@" · 규칙 파일 오류"];
+    return line;
+}
+
 NSString* verdict_label(const std::string& v) {
     if (v == "malicious") return @"악성";
     if (v == "suspicious") return @"의심";
@@ -72,12 +111,14 @@ NSString* action_label(const std::string& a) {
     NSStatusItem* _item;
     NSMenuItem* _stateItem;
     NSMenuItem* _detailItem;
+    NSMenuItem* _sensorItem;
     NSMenuItem* _scanItem;
     NSMenuItem* _pauseItem;
     NSWindow* _window;
     NSTextView* _text;
     NSTimer* _timer;
     size_t _notified;
+    size_t _alertNotified;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
@@ -94,12 +135,18 @@ NSString* action_label(const std::string& a) {
     g_realtime.reset();
     g_agent.reset();
     g_store.reset();
+    g_feed.reset();
 }
 
 - (void)startEngine {
     sec::Config cfg;
     cfg.load(sec::AgentConfig::default_data_dir() / "sec.conf");
     g_config = sec::AgentConfig::from_config(cfg);
+    g_behavior_dir = sec::util::path_from_utf8(cfg.get("behavior_dir", "/Library/Application Support/SecEPP"));
+    g_feed = std::make_unique<sec::behavior::AlertFeed>(g_behavior_dir / "behavior_alerts.tsv",
+                                                        g_config.data_dir / "behavior_seen.txt");
+    g_feed->poll();
+    _alertNotified = g_feed->total();
     if (g_config.scan_paths.empty()) g_config.scan_paths = g_config.watch_paths;
 
     sec::log::set_console(false);
@@ -139,11 +186,14 @@ NSString* action_label(const std::string& a) {
     _stateItem.enabled = NO;
     _detailItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
     _detailItem.enabled = NO;
+    _sensorItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    _sensorItem.enabled = NO;
     [menu addItem:_stateItem];
     [menu addItem:_detailItem];
+    [menu addItem:_sensorItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem* list = [[NSMenuItem alloc] initWithTitle:@"탐지 목록 열기…" action:@selector(openList:) keyEquivalent:@"l"];
+    NSMenuItem* list = [[NSMenuItem alloc] initWithTitle:@"탐지·행위 알림 목록 열기…" action:@selector(openList:) keyEquivalent:@"l"];
     list.target = self;
     list.enabled = YES;
     [menu addItem:list];
@@ -198,8 +248,19 @@ NSString* action_label(const std::string& a) {
         return;
     }
 
+    if (g_feed) g_feed->poll();
+    {
+        const auto status = sec::behavior::read_status(g_behavior_dir / "sensor_status.txt");
+        g_sensor_fresh = status.has_value() && sec::behavior::status_is_fresh(*status, sec::behavior::now_ms());
+        if (status.has_value()) g_sensor = *status;
+    }
+    _sensorItem.title = sensor_line();
+
     const size_t total = g_store->total();
-    const size_t unseen = g_store->unseen();
+    const size_t file_unseen = g_store->unseen();
+    const size_t behavior_unseen = g_feed ? g_feed->unseen() : 0;
+    const size_t behavior_total = g_feed ? g_feed->total() : 0;
+    const size_t unseen = file_unseen + behavior_unseen;
     const sec::RealtimeStats st = g_realtime->stats();
     const bool paused = g_realtime->paused();
 
@@ -211,7 +272,8 @@ NSString* action_label(const std::string& a) {
         symbol = @"exclamationmark.shield.fill";
         tint = NSColor.systemRedColor;
         fallback = @"Sec !";
-        state = [NSString stringWithFormat:@"⚠ 새 탐지 %zu건 — 목록을 확인하세요", unseen];
+        state = [NSString stringWithFormat:@"⚠ 새 탐지 %zu건 (파일 %zu · 행위 %zu) — 목록을 확인하세요", unseen,
+                                           file_unseen, behavior_unseen];
     } else if (!g_config.realtime_enabled) {
         symbol = @"shield.slash";
         fallback = @"Sec ○";
@@ -234,8 +296,8 @@ NSString* action_label(const std::string& a) {
     _item.button.toolTip = state;
 
     _stateItem.title = state;
-    _detailItem.title = [NSString stringWithFormat:@"누적 탐지 %zu건 · 실시간 검사 %llu개", total,
-                                                   (unsigned long long)st.scanned];
+    _detailItem.title = [NSString stringWithFormat:@"누적 파일 탐지 %zu건 · 행위 알림 %zu건 · 실시간 검사 %llu개",
+                                                   total, behavior_total, (unsigned long long)st.scanned];
     _pauseItem.title = paused ? @"실시간 보호 재개" : @"실시간 보호 일시정지";
 
     if (total > _notified) {
@@ -250,17 +312,28 @@ NSString* action_label(const std::string& a) {
         _notified = total;
     }
 
+    if (g_feed && behavior_total > _alertNotified) {
+        const auto alerts = g_feed->recent();
+        if (!alerts.empty()) {
+            const auto& a = alerts.front();
+            NSString* title = [NSString stringWithFormat:@"Sec: 행위 탐지 (%@)", level_label(a.level)];
+            NSString* body = [NSString stringWithFormat:@"%@\n%@", ns(a.title), ns(a.detail)];
+            post_notification(title, body);
+        }
+        _alertNotified = behavior_total;
+    }
+
     if (_window != nil && _window.visible) [self reloadText];
 }
 
 - (void)buildWindow {
-    NSRect frame = NSMakeRect(0, 0, 700, 460);
+    NSRect frame = NSMakeRect(0, 0, 780, 560);
     _window = [[NSWindow alloc] initWithContentRect:frame
                                           styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                      NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
-    _window.title = @"Sec — 탐지 목록";
+    _window.title = @"Sec — 탐지 · 행위 알림";
     [_window setReleasedWhenClosed:NO];
     [_window center];
 
@@ -286,6 +359,25 @@ NSString* action_label(const std::string& a) {
 - (void)reloadText {
     if (_text == nil || !g_store) return;
     NSMutableString* s = [NSMutableString string];
+
+    [s appendString:@"■ 행위 탐지 알림 (침투 → 지속성 → C2)\n"];
+    [s appendFormat:@"  %@\n\n", sensor_line()];
+    const auto alerts = g_feed ? g_feed->recent() : std::vector<sec::behavior::Alert>();
+    if (alerts.empty()) {
+        [s appendString:@"  행위 알림이 없습니다.\n\n"];
+    } else {
+        [s appendFormat:@"  누적 %zu건 (최근 %zu건 표시)\n\n", g_feed->total(), alerts.size()];
+        for (const auto& a : alerts) {
+            [s appendFormat:@"[%@] %@  %@\n", local_time_ms(a.time_ms), level_label(a.level), ns(a.title)];
+            [s appendFormat:@"  프로세스: %@ (PID %d, 점수 %d)\n", ns(a.process_path), a.pid, a.score];
+            if (!a.chain.empty()) [s appendFormat:@"  체인: %@\n", joined(a.chain, @" > ")];
+            if (!a.rule_ids.empty()) [s appendFormat:@"  규칙: %@\n", joined(a.rule_ids, @", ")];
+            if (!a.techniques.empty()) [s appendFormat:@"  ATT&CK: %@\n", joined(a.techniques, @", ")];
+            [s appendFormat:@"  이벤트: %@\n\n", ns(a.detail)];
+        }
+    }
+
+    [s appendString:@"■ 파일 탐지\n\n"];
     const auto records = g_store->recent();
     if (records.empty()) {
         [s appendString:@"✅ 탐지된 항목이 없습니다.\n\n"];
@@ -306,6 +398,7 @@ NSString* action_label(const std::string& a) {
 - (void)openList:(id)sender {
     if (_window == nil) [self buildWindow];
     if (g_store) g_store->mark_seen();
+    if (g_feed) g_feed->mark_seen();
     [self reloadText];
     [self refresh];
     [NSApp activateIgnoringOtherApps:YES];

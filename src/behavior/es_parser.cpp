@@ -158,6 +158,13 @@ std::optional<std::int64_t> parse_iso8601_ms(std::string_view s) {
 }
 
 ParseResult parse_eslogger_line(std::string_view line) {
+    // `close` events are by far the most frequent; skip unmodified ones before the (expensive) JSON parse.
+    const std::size_t mod = line.find("\"modified\"");
+    if (mod != std::string_view::npos) {
+        std::size_t i = mod + 10;
+        while (i < line.size() && (line[i] == ' ' || line[i] == ':')) ++i;
+        if (line.compare(i, 5, "false") == 0) return skipped();
+    }
     std::string perr;
     const auto doc = json::parse(line, &perr);
     if (!doc || !doc->is_object()) return error("invalid JSON: " + perr);

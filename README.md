@@ -16,11 +16,15 @@ The project started as a file scanner. A lot of real attacks are easier to catch
 - Hash DB, signature and PE heuristic scanning, plus quarantine
 - Behavior engine with about 35 built-in rules, extendable or overridable with JSON
 - `behavior-replay`, a command that feeds recorded events through the engine
+- `sec-sensord`, a root daemon that collects live events (eslogger + TCP socket polling), runs the engine and writes alerts
+- The menu bar app shows those alerts (red icon, notification, list window) and whether the sensor is running
 
 ## What doesn't work yet
 
-- **No live behavior sensors.** The engine currently runs on event files. Collecting events from a running Mac and feeding them in, and showing those alerts in the menu bar app, still has to be built.
+- **The live sensor code hasn't run on a real Mac yet.** `sec-sensord`, the libproc socket polling and the menu bar integration are written and the portable parts are tested on Linux, but the macOS-specific parts (libproc, `main.mm`, the LaunchDaemon install) are unverified. Expect a round of fixes.
 - **The eslogger parser hasn't been checked against real output.** It follows the JSON layout I expect from `eslogger`, but I haven't verified it on a real Mac yet (see "Checking against eslogger" below).
+- No DNS visibility. Without a Network Extension there's no source for DNS queries, so the DNS rules only run on replayed events.
+- Socket polling sees a connection only if it lives longer than the poll interval (1 second by default), and it only reports new connections, not ones that already existed when the sensor started.
 - **No pre-execution blocking.** FSEvents tells you about a file after it exists, so file scanning is detect-after-the-fact. Blocking before execution needs the EndpointSecurity entitlement, which requires Apple's approval, so it isn't used here.
 - No Mach-O or ELF static analysis. Those files only get hash and pattern checks.
 - Quarantined files are obscured with XOR, not encrypted.
@@ -32,7 +36,9 @@ The project started as a file scanner. A lot of real attacks are easier to catch
 src/common     SHA-256 (own implementation), logging, config, JSON parser, utilities
 src/scanner    hash DB, PE analysis, scan engine, quarantine
 src/agent      agent core, real-time scan queue, detection store
-src/behavior   behavior detection: event model, process tree, rule engine, eslogger parser
+src/behavior   behavior detection: event model, process tree, rule engine, eslogger parser, alert store
+src/sensor     live sensors: sensor service, eslogger runner, socket polling (non-Windows)
+src/sensord    sec-sensord daemon
 src/monitor    FSEvents file watcher (macOS only)
 src/macapp     menu bar app (macOS only)
 src/cli        sec-cli
@@ -57,11 +63,11 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-This produces `sec-cli`, `sec-agentd` and `sec-menubar`. If CMake complains about a different cache path, you probably copied a `build` folder from another machine. Delete it and configure again.
+This produces `sec-cli`, `sec-agentd`, `sec-sensord` and `sec-menubar`. If CMake complains about a different cache path, you probably copied a `build` folder from another machine. Delete it and configure again.
 
 The core also builds on Linux with the same commands (without the menu bar app and FSEvents). Windows should work with Visual Studio and CMake, but I haven't tested it as much as macOS.
 
-On Linux the test suite (694 checks) passes under ASan/UBSan and TSan. I haven't run the behavior tests on a Mac yet.
+On Linux the test suite (1116 checks) passes under ASan/UBSan and TSan. I haven't run the behavior tests on a Mac yet.
 
 ## Menu bar app
 
@@ -98,6 +104,37 @@ sec-cli quarantine restore <id>
 Heuristics can produce false positives, which is why `auto_quarantine` is off. Tune the thresholds against a set of clean files before relying on it.
 
 ## Behavior detection
+
+### Running the live sensor (macOS 13+)
+
+The sensor needs root, because `eslogger` only works as root. It runs as a LaunchDaemon and the menu bar app (which runs as you) reads its output.
+
+```sh
+cmake --build build
+sudo packaging/macos/install_sensord.sh
+```
+
+Then give the binary Full Disk Access: System Settings → Privacy & Security → Full Disk Access → `+` → `/usr/local/libexec/sec/sec-sensord` (press Cmd+Shift+G to type the path). If it still fails, add `/usr/bin/eslogger` the same way. Restart it afterwards:
+
+```sh
+sudo launchctl kickstart -k system/com.sec.epp.sensord
+cat "/Library/Application Support/SecEPP/sensor_status.txt"
+```
+
+`sensor_status.txt` shows whether eslogger and the socket poller are running, how many events were processed, and the last error. The menu bar app shows the same state in its menu. Every rebuild changes the ad-hoc signature, so macOS may ask for the permission again.
+
+Files in `/Library/Application Support/SecEPP/`:
+
+- `behavior_alerts.tsv`: alerts, one per line (the menu bar app reads this)
+- `behavior_rules.json`: optional, your rules, merged over the built-in ones
+- `ioc.json`: optional IOC list
+- `logs/sensord.log`
+
+If the menu bar app should read from another folder, set `behavior_dir` in its `sec.conf`. Remove the sensor with `sudo packaging/macos/install_sensord.sh --uninstall`.
+
+You can also run it by hand to try it out: `sudo build/src/sensord/sec-sensord --console --data-dir /tmp/sec-test`, or feed it recorded events with `--source stdin < events.jsonl`.
+
+### How it works
 
 ```
 sensor → normalized events → process tree → rules / correlation → warning or critical alert
@@ -182,9 +219,9 @@ Input can be either eslogger JSON lines or this project's normalized JSONL; the 
 
 ## Next up
 
-- macOS sensors: an eslogger runner and socket polling
-- Show behavior alerts in the menu bar app
-- Load rule and IOC files from the data folder
+- Run the sensor on a real Mac and fix what breaks (eslogger JSON layout, libproc, permissions)
+- Process signing info for processes that started before the sensor did
+- DNS visibility through a Network Extension
 - Validate rules against real attack simulations (Atomic Red Team and similar) and cut down false positives
 - Encrypt quarantined files (AES-GCM)
 - Mach-O analysis

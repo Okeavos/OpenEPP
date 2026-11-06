@@ -14,4 +14,7 @@ realtime = true
 # Quarantine files judged "malicious" automatically (heuristics can false-positive: leave off until tuned)
 auto_quarantine = false
 
+# Where the menu bar app reads behavior alerts and sensor status from (written by sec-sensord)
+# behavior_dir = /Library/Application Support/SecEPP
+
 log_level = info
