@@ -1,0 +1,3 @@
+# Known-bad SHA-256 list. Format: <sha256> [threat name]
+# EICAR standard test file (68 bytes)
+275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f EICAR-Test-File

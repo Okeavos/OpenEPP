@@ -1,0 +1,19 @@
+# Sec EPP agent configuration. Copy to %ProgramData%\SecEPP\sec.conf
+
+# data_dir        = C:\ProgramData\SecEPP
+# hash_db         = C:\ProgramData\SecEPP\hashes.txt
+
+# Semicolon-separated list of paths to scan
+scan_paths = C:\Users\Public\Downloads
+
+# 0 = scan once at start; N = rescan every N minutes
+scan_interval_minutes = 0
+
+# Quarantine files judged "malicious" automatically (heuristics can false-positive: leave off until tuned)
+auto_quarantine = false
+
+max_file_size_mb = 512
+suspicious_threshold = 40
+malicious_threshold = 90
+
+log_level = info

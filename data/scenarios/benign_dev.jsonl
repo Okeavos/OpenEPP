@@ -1,0 +1,9 @@
+# Sec behaviour scenario: normal developer activity that must NOT alert (normalized format)
+{"type":"exec","time_ms":2000000,"pid":600,"ppid":1,"path":"/Applications/Terminal.app/Contents/MacOS/Terminal","args":["Terminal"],"signing":"platform"}
+{"type":"exec","time_ms":2001000,"pid":601,"ppid":600,"path":"/bin/zsh","args":["zsh"],"signing":"platform"}
+{"type":"exec","time_ms":2002000,"pid":602,"ppid":601,"path":"/usr/bin/clang","args":["clang","-o","/tmp/hello","hello.c"],"signing":"platform"}
+{"type":"file_create","time_ms":2003000,"pid":602,"path":"/usr/bin/clang","file":"/tmp/hello","signing":"platform"}
+{"type":"exec","time_ms":2004000,"pid":603,"ppid":601,"path":"/tmp/hello","args":["/tmp/hello"],"signing":"adhoc"}
+{"type":"net","time_ms":2005000,"pid":603,"path":"/tmp/hello","remote_ip":"192.168.1.10","remote_port":8080,"signing":"adhoc"}
+{"type":"exec","time_ms":2006000,"pid":604,"ppid":601,"path":"/usr/bin/curl","args":["curl","-s","https://api.github.com"],"signing":"platform"}
+{"type":"net","time_ms":2007000,"pid":604,"path":"/usr/bin/curl","remote_ip":"140.82.112.5","remote_port":443,"remote_host":"api.github.com","signing":"platform"}

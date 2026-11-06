@@ -1,0 +1,17 @@
+# macOS: copy to ~/Library/Application Support/SecEPP/sec.conf
+# (Windows PE files are analysed on any OS; Mach-O/ELF are not parsed yet - only hash/pattern checks apply.)
+
+# Real-time monitoring (menu bar app). Default: ~/Downloads;~/Desktop;~/Documents
+# "~" is expanded; separate folders with ";"
+watch_paths = ~/Downloads;~/Desktop;~/Documents
+realtime = true
+
+# Folders for "전체 검사 실행" and the periodic scan (default: same as watch_paths)
+# scan_paths = ~/Downloads
+
+# Known-bad hashes: put hashes.txt next to this file (see data/hashes.sample.txt)
+
+# Quarantine files judged "malicious" automatically (heuristics can false-positive: leave off until tuned)
+auto_quarantine = false
+
+log_level = info
