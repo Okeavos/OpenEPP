@@ -16,6 +16,10 @@ constexpr std::int64_t kRecentDownloadMs = 3600LL * 1000;
 constexpr std::size_t kMaxWritten = 8192;
 constexpr std::size_t kMaxBeaconKeys = 4096;
 constexpr std::size_t kBeaconWindow = 12;
+constexpr std::size_t kRecentKeep = 512;
+constexpr std::size_t kContextLines = 12;
+constexpr std::int64_t kContextWindowMs = 900LL * 1000;
+constexpr std::size_t kMaxSuspects = 4;
 
 std::string lc(const std::string& s) { return util::to_lower(s); }
 
@@ -110,6 +114,26 @@ std::string json_str_array(const std::vector<std::string>& v) {
     return o;
 }
 
+bool is_staging_path(const std::string& lower_path) {
+    static const char* const kPrefixes[] = {"/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/",
+                                            "/users/shared/", "/dev/shm/"};
+    for (const char* p : kPrefixes) {
+        if (starts_with(lower_path, p)) return true;
+    }
+    return contains(lower_path, "/downloads/");
+}
+
+bool rule_selected(const std::vector<std::string>& patterns, const std::string& id) {
+    for (const std::string& p : patterns) {
+        if (!p.empty() && p.back() == '*') {
+            if (id.compare(0, p.size() - 1, p, 0, p.size() - 1) == 0) return true;
+        } else if (p == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string pid_label(const ProcNode& n) {
     return (n.name.empty() ? std::string("?") : n.name) + "(" + std::to_string(n.pid) + ")";
 }
@@ -140,6 +164,8 @@ std::string describe_event(const Event& ev) {
 
 }
 
+std::string event_summary(const Event& ev) { return describe_event(ev); }
+
 std::string alert_to_json(const Alert& a) {
     std::string o = "{";
     o += "\"time_ms\":" + std::to_string(a.time_ms);
@@ -151,7 +177,9 @@ std::string alert_to_json(const Alert& a) {
     o += ",\"rules\":" + json_str_array(a.rule_ids);
     o += ",\"techniques\":" + json_str_array(a.techniques);
     o += ",\"chain\":" + json_str_array(a.chain);
-    o += ",\"detail\":\"" + json_escape(a.detail) + "\"}";
+    o += ",\"detail\":\"" + json_escape(a.detail) + "\"";
+    o += ",\"context\":" + json_str_array(a.context);
+    o += ",\"files\":" + json_str_array(a.files) + "}";
     return o;
 }
 
@@ -184,6 +212,14 @@ std::string alert_to_text(const Alert& a) {
         o += "\n";
     }
     o += "  이벤트: " + a.detail + "\n";
+    if (!a.files.empty()) {
+        o += "  관련 파일:\n";
+        for (const std::string& f : a.files) o += "    " + f + "\n";
+    }
+    if (!a.context.empty()) {
+        o += "  직전 활동:\n";
+        for (const std::string& c : a.context) o += "    " + c + "\n";
+    }
     return o;
 }
 
@@ -310,8 +346,8 @@ std::vector<std::string> Engine::compute_features(const Event& ev, const ProcNod
     return f;
 }
 
-bool Engine::match_condition(const Rule& rule, const ProcNode& node, const EvalCtx& ctx, std::int64_t now_ms) const {
-    const Condition& c = rule.when;
+bool Engine::match_cond(const Condition& c, int rule_window_s, const ProcNode& node, const EvalCtx& ctx,
+                        std::int64_t now_ms) const {
 
     if (!c.name_any.empty() && !equals_any(node.name, c.name_any)) return false;
     if (!c.name_not_any.empty() && equals_any(node.name, c.name_not_any)) return false;
@@ -335,6 +371,9 @@ bool Engine::match_condition(const Rule& rule, const ProcNode& node, const EvalC
     }
     if (c.unsigned_process && node.is_unsigned() != *c.unsigned_process) return false;
     if (c.platform_binary && node.platform_binary != *c.platform_binary) return false;
+    if (!c.team_id_any.empty() && !equals_any(ctx.team_id, c.team_id_any)) return false;
+    if (!c.signing_id_any.empty() && !equals_any(ctx.signing_id, c.signing_id_any)) return false;
+    if (!c.env_contains_any.empty() && !contains_any(ctx.env, c.env_contains_any)) return false;
 
     if (!c.file_path_prefix_any.empty() && !prefix_any(ctx.file_path, c.file_path_prefix_any)) return false;
     if (!c.file_path_contains_any.empty() && !contains_any(ctx.file_path, c.file_path_contains_any)) return false;
@@ -342,6 +381,26 @@ bool Engine::match_condition(const Rule& rule, const ProcNode& node, const EvalC
     if (!c.file_ext_any.empty() && !equals_any(ctx.file_ext, c.file_ext_any)) return false;
 
     if (c.remote_public && ctx.remote_public != *c.remote_public) return false;
+    if (!c.remote_ip_any.empty()) {
+        bool ok = false;
+        for (const std::string& spec : c.remote_ip_any) {
+            if (!ctx.remote_ip.empty() && net::ip_matches(ctx.remote_ip, spec)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) return false;
+    }
+    if (!c.remote_host_any.empty()) {
+        bool ok = false;
+        for (const std::string& pat : c.remote_host_any) {
+            if (!ctx.host.empty() && net::host_matches(ctx.host, pat)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) return false;
+    }
     if (!c.port_any.empty() && std::find(c.port_any.begin(), c.port_any.end(), ctx.remote_port) == c.port_any.end()) {
         return false;
     }
@@ -361,7 +420,7 @@ bool Engine::match_condition(const Rule& rule, const ProcNode& node, const EvalC
         if (!ok) return false;
     }
     if (!c.requires_tag_any.empty()) {
-        const std::int64_t window_ms = 1000LL * (rule.window_s > 0 ? rule.window_s : rules_.tag_window_s);
+        const std::int64_t window_ms = 1000LL * (rule_window_s > 0 ? rule_window_s : rules_.tag_window_s);
         bool ok = false;
         for (const std::string& t : c.requires_tag_any) {
             const auto it = node.tags.find(t);
@@ -373,6 +432,42 @@ bool Engine::match_condition(const Rule& rule, const ProcNode& node, const EvalC
         if (!ok) return false;
     }
     return true;
+}
+
+bool Engine::is_allowed(const Rule& rule, const ProcNode& node, const EvalCtx& ctx, std::int64_t now_ms) const {
+    for (const AllowEntry& e : rules_.allowlist) {
+        if (e.event && *e.event != rule.event) continue;
+        if (!e.rules.empty() && !rule_selected(e.rules, rule.id)) continue;
+        if (!match_cond(e.when, 0, node, ctx, now_ms)) continue;
+        return true;
+    }
+    return false;
+}
+
+std::vector<std::string> Engine::build_context(const std::vector<const ProcNode*>& chain, std::int64_t now_ms) const {
+    std::set<int> pids;
+    for (const ProcNode* n : chain) {
+        if (n->pid > 1) pids.insert(n->pid);  // launchd's children are every daemon on the system
+    }
+
+    std::vector<const Recent*> picked;
+    for (auto it = recent_.rbegin(); it != recent_.rend() && picked.size() < kContextLines; ++it) {
+        if (now_ms - it->time_ms > kContextWindowMs) break;
+        if (pids.count(it->pid) != 0 || pids.count(it->ppid) != 0) picked.push_back(&*it);
+    }
+    std::vector<std::string> out;
+    for (auto it = picked.rbegin(); it != picked.rend(); ++it) {
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "T%+.1fs", static_cast<double>((*it)->time_ms - now_ms) / 1000.0);
+        out.push_back(std::string(buf) + "  " + (*it)->text);
+    }
+    return out;
+}
+
+void Engine::seed_process(const ProcessRef& ref, std::int64_t time_ms) {
+    if (ref.pid <= 0) return;
+    tree_.seed(ref, time_ms);
+    ++seeded_;
 }
 
 std::vector<Alert> Engine::process(const Event& ev) {
@@ -421,8 +516,16 @@ std::vector<Alert> Engine::process(const Event& ev) {
         note_file_write(ev, *node);
     }
 
+    recent_.push_back(Recent{now, node->pid, node->ppid, pid_label(*node) + "  " + describe_event(ev)});
+    if (recent_.size() > kRecentKeep) recent_.pop_front();
+
     EvalCtx ctx;
     ctx.path = lc(node->path);
+    ctx.team_id = lc(node->team_id);
+    ctx.signing_id = lc(node->signing_id);
+    ctx.env = lc(join_args(node->env));
+    ctx.remote_ip = ev.remote_ip;
+    ctx.host = lc(ev.type == EventType::DnsQuery ? ev.dns_name : ev.remote_host);
     ctx.cmdline = lc(node->args.empty() ? node->path : join_args(node->args));
     ctx.file_path = lc(ev.file_path);
     if (!ctx.file_path.empty()) {
@@ -457,7 +560,11 @@ std::vector<Alert> Engine::process(const Event& ev) {
             const bool tag_rule = !r.when.requires_tag_any.empty();
             if ((phase == 2) != tag_rule) continue;
             if (node->hit_ids.count(r.id) != 0) continue;
-            if (!match_condition(r, *node, ctx, now)) continue;
+            if (!match_cond(r.when, r.window_s, *node, ctx, now)) continue;
+            if (!rules_.allowlist.empty() && is_allowed(r, *node, ctx, now)) {
+                ++suppressed_;
+                continue;
+            }
 
             node->hit_ids.insert(r.id);
             node->hits.push_back(r.id);
@@ -498,6 +605,21 @@ std::vector<Alert> Engine::process(const Event& ev) {
             if (!r.technique.empty() && seen_tech.insert(r.technique).second) a.techniques.push_back(r.technique);
         }
     }
+    a.context = build_context(chain, now);
+    for (std::size_t i = 0; i < chain.size() && i < 6 && a.suspect_paths.size() < kMaxSuspects; ++i) {
+        const std::string& p = chain[i]->path;
+        if (p.empty() || p[0] != '/') continue;
+        if (!chain[i]->is_unsigned() && !is_staging_path(lc(p))) continue;
+        if (std::find(a.suspect_paths.begin(), a.suspect_paths.end(), p) == a.suspect_paths.end()) {
+            a.suspect_paths.push_back(p);
+        }
+    }
+    if (rule_event_of(ev.type) == RuleEvent::File && !ev.file_path.empty() && ev.file_path[0] == '/' &&
+        a.suspect_paths.size() < kMaxSuspects && is_staging_path(lc(ev.file_path)) &&
+        std::find(a.suspect_paths.begin(), a.suspect_paths.end(), ev.file_path) == a.suspect_paths.end()) {
+        a.suspect_paths.push_back(ev.file_path);
+    }
+
     constexpr std::size_t kMaxTitles = 4;
     const std::size_t from = titles.size() > kMaxTitles ? titles.size() - kMaxTitles : 0;
     if (from > 0) a.title = "… → ";

@@ -21,6 +21,7 @@ struct ProcNode {
     std::string path;
     std::string name;  // lowercase basename
     std::vector<std::string> args;
+    std::vector<std::string> env;  // "DYLD_*" / "LD_PRELOAD" entries of the current image
     std::string signing_id;
     std::string team_id;
     bool platform_binary = false;
@@ -50,6 +51,8 @@ public:
     // Process seen as the actor of a non-exec event; fills in missing details.
     ProcNode& upsert_actor(const ProcessRef& ref, std::int64_t time_ms);
     void on_exit(int pid, std::int64_t time_ms);
+    // Registers a process that was already running when the sensor started. No rules are evaluated.
+    ProcNode& seed(const ProcessRef& ref, std::int64_t time_ms);
 
     ProcNode* find(int pid);
     const ProcNode* find(int pid) const;

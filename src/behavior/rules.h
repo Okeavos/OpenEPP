@@ -26,6 +26,9 @@ struct Condition {
     std::vector<std::vector<std::string>> args_all_of_any;  // every group must match (group = OR)
     std::optional<bool> unsigned_process;
     std::optional<bool> platform_binary;
+    std::vector<std::string> team_id_any;            // exact team identifier of the acting process
+    std::vector<std::string> signing_id_any;         // exact signing identifier of the acting process
+    std::vector<std::string> env_contains_any;       // substring of the "DYLD_*" environment entries (exec)
 
     // file events
     std::vector<std::string> file_path_prefix_any;
@@ -37,6 +40,8 @@ struct Condition {
     std::vector<int> port_any;
     std::vector<int> port_not_any;
     std::optional<bool> remote_public;
+    std::vector<std::string> remote_ip_any;          // IPv4 or CIDR
+    std::vector<std::string> remote_host_any;        // host pattern ("example.com", "*.example.com"); also DNS names
 
     // correlation
     std::vector<std::string> requires_tag_any;       // tag seen on this process/ancestors within the window
@@ -52,6 +57,16 @@ struct Rule {
     std::string technique;  // MITRE ATT&CK id, informational
     bool enabled = true;
     int window_s = 0;       // tag window override (0 = ruleset default)
+    Condition when;
+};
+
+// Suppresses rule hits that match: the rule is skipped, so it adds no score and sets no tag.
+// Strings in `rules` are rule ids; a trailing '*' makes it a prefix ("mac.net.*"). Empty = every rule.
+struct AllowEntry {
+    std::string id;    // label shown in logs
+    std::string note;  // free text for the analyst
+    std::vector<std::string> rules;
+    std::optional<RuleEvent> event;
     Condition when;
 };
 
@@ -71,6 +86,7 @@ struct RuleSet {
     int critical_threshold = 100;
     int tag_window_s = 900;
     EgressPolicy egress;
+    std::vector<AllowEntry> allowlist;
 };
 
 // IOC lists: IPs/CIDRs and host patterns.
@@ -89,7 +105,8 @@ std::string default_rules_json();
 RuleSet default_ruleset();
 
 // Layer `overlay` (a user rule file) over `base` (the built-ins): rules with the same id replace the
-// built-in one, new ids append. Thresholds, tag window and the egress policy come from `overlay`.
+// built-in one, new ids append. Thresholds, tag window and the egress policy come from `overlay`;
+// allowlist entries of the overlay are appended.
 void merge_ruleset(RuleSet& base, const RuleSet& overlay);
 
 }

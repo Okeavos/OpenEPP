@@ -79,6 +79,8 @@ struct SensorStatus {
     std::uint64_t dropped = 0;
     std::uint64_t alerts = 0;
     std::uint64_t parse_errors = 0;
+    std::uint64_t suppressed = 0;  // rule hits skipped by the allowlist
+    std::uint64_t seeded = 0;      // processes already running at start-up
     std::string last_error;
     std::string rules_error;
 };

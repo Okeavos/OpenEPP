@@ -25,6 +25,20 @@ ParseResult ok(Event ev) {
     return r;
 }
 
+// Keeps only the environment entries rules care about; the full environment is large and may hold secrets.
+void collect_env(const Value& arr, std::vector<std::string>& out) {
+    constexpr std::size_t kMaxEntries = 16;
+    constexpr std::size_t kMaxLen = 512;
+    if (!arr.is_array()) return;
+    for (const Value& e : arr.items()) {
+        if (out.size() >= kMaxEntries) break;
+        const std::string s = e.as_string();
+        if (s.rfind("DYLD_", 0) == 0 || s.rfind("LD_PRELOAD", 0) == 0) {
+            out.push_back(s.size() > kMaxLen ? s.substr(0, kMaxLen) : s);
+        }
+    }
+}
+
 // es_file_t is rendered as {"path": "...", ...}; accept a bare string as well.
 std::string file_path_of(const Value& v) {
     if (v.is_string()) return v.as_string();
@@ -80,6 +94,7 @@ ProcessRef normalized_process(const Value& v) {
             for (const Value& a : args->items()) r.args.push_back(a.as_string());
         }
     }
+    if (const Value* env = v.find("env")) collect_env(*env, r.env);
     const std::string sg = v["signing"].as_string();
     if (sg == "platform") {
         r.sig_known = true;
@@ -185,6 +200,7 @@ ParseResult parse_eslogger_line(std::string_view line) {
                 for (const Value& a : args->items()) out.proc.args.push_back(a.as_string());
             }
         }
+        if (const Value* env = body.find("env")) collect_env(*env, out.proc.env);
         if (out.proc.pid <= 0) return error("exec: missing pid");
         return ok(std::move(out));
     }

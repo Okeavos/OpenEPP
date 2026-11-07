@@ -19,7 +19,10 @@ void assign_image(ProcNode& n, const ProcessRef& ref, bool with_args) {
         n.path = ref.path;
         n.name = name_of(ref.path);
     }
-    if (with_args) n.args = ref.args;
+    if (with_args) {
+        n.args = ref.args;
+        n.env = ref.env;
+    }
     if (ref.sig_known) {
         n.signing_id = ref.signing_id;
         n.team_id = ref.team_id;
@@ -56,6 +59,17 @@ ProcNode& ProcessTree::on_exec(const ProcessRef& ref, std::int64_t time_ms) {
         ProcNode& n = it->second;
         assign_image(n, ref, true);
         n.hit_ids.clear();
+        if (n.ppid == 0) n.ppid = ref.ppid;
+        return n;
+    }
+    return create(ref, time_ms, true);
+}
+
+ProcNode& ProcessTree::seed(const ProcessRef& ref, std::int64_t time_ms) {
+    const auto it = nodes_.find(ref.pid);
+    if (it != nodes_.end() && !it->second.exited) {
+        ProcNode& n = it->second;
+        assign_image(n, ref, true);
         if (n.ppid == 0) n.ppid = ref.ppid;
         return n;
     }

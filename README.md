@@ -14,7 +14,8 @@ The project started as a file scanner. A lot of real attacks are easier to catch
 - macOS menu bar app: an icon shows the state, and clicking it opens a list of detections
 - Real-time folder watching (FSEvents) on Downloads, Desktop and Documents by default
 - Hash DB, signature and PE heuristic scanning, plus quarantine
-- Behavior engine with about 35 built-in rules, extendable or overridable with JSON
+- Behavior engine with about 43 built-in rules, extendable or overridable with JSON, plus an allowlist for known-good activity
+- Alerts carry the recent activity of the process chain, and the files involved are hashed and run through the file scanner
 - `behavior-replay`, a command that feeds recorded events through the engine
 - `sec-sensord`, a root daemon that collects live events (eslogger + TCP socket polling), runs the engine and writes alerts
 - The menu bar app shows those alerts (red icon, notification, list window) and whether the sensor is running
@@ -25,6 +26,7 @@ The project started as a file scanner. A lot of real attacks are easier to catch
 - **The eslogger parser hasn't been checked against real output.** It follows the JSON layout I expect from `eslogger`, but I haven't verified it on a real Mac yet (see "Checking against eslogger" below).
 - No DNS visibility. Without a Network Extension there's no source for DNS queries, so the DNS rules only run on replayed events.
 - Socket polling sees a connection only if it lives longer than the poll interval (1 second by default), and it only reports new connections, not ones that already existed when the sensor started.
+- At start-up the sensor takes a snapshot of running processes (path, parent, arguments, code signature) so that processes launched before it are not "unknown". That snapshot code is macOS-only and unverified, like the rest of the live sensor. Signatures are read without full validation, and "anchor apple" is used as the stand-in for "platform binary", so Apple-signed apps such as Xcode count as platform binaries here but not in eslogger's view.
 - **No pre-execution blocking.** FSEvents tells you about a file after it exists, so file scanning is detect-after-the-fact. Blocking before execution needs the EndpointSecurity entitlement, which requires Apple's approval, so it isn't used here.
 - No Mach-O or ELF static analysis. Those files only get hash and pattern checks.
 - Quarantined files are obscured with XOR, not encrypted.
@@ -37,7 +39,7 @@ src/common     SHA-256 (own implementation), logging, config, JSON parser, utili
 src/scanner    hash DB, PE analysis, scan engine, quarantine
 src/agent      agent core, real-time scan queue, detection store
 src/behavior   behavior detection: event model, process tree, rule engine, eslogger parser, alert store
-src/sensor     live sensors: sensor service, eslogger runner, socket polling (non-Windows)
+src/sensor     live sensors: sensor service, eslogger runner, socket polling, start-up process snapshot, alert enricher (non-Windows)
 src/sensord    sec-sensord daemon
 src/monitor    FSEvents file watcher (macOS only)
 src/macapp     menu bar app (macOS only)
@@ -67,7 +69,7 @@ This produces `sec-cli`, `sec-agentd`, `sec-sensord` and `sec-menubar`. If CMake
 
 The core also builds on Linux with the same commands (without the menu bar app and FSEvents). Windows should work with Visual Studio and CMake, but I haven't tested it as much as macOS.
 
-On Linux the test suite (1116 checks) passes under ASan/UBSan and TSan. I haven't run the behavior tests on a Mac yet.
+On Linux the test suite (1300 checks) passes under ASan/UBSan and TSan. I haven't run the behavior tests on a Mac yet.
 
 ## Menu bar app
 
@@ -126,11 +128,15 @@ cat "/Library/Application Support/SecEPP/sensor_status.txt"
 Files in `/Library/Application Support/SecEPP/`:
 
 - `behavior_alerts.tsv`: alerts, one per line (the menu bar app reads this)
-- `behavior_rules.json`: optional, your rules, merged over the built-in ones
+- `behavior_rules.json`: optional, your rules and allowlist, merged over the built-in ones
 - `ioc.json`: optional IOC list
+- `hashes.txt`: optional hash DB; files an alert points to are checked against it (or pass `--hashes FILE`)
 - `logs/sensord.log`
+- `logs/sensord-events.log`: one line per event, only with `--verbose` (reset at every start, capped at 64 MB)
 
 If the menu bar app should read from another folder, set `behavior_dir` in its `sec.conf`. Remove the sensor with `sudo packaging/macos/install_sensord.sh --uninstall`.
+
+Useful options: `--verbose` (per-event trace, for debugging), `--no-snapshot` (skip the start-up process snapshot), `--no-scan` (don't hash or scan the files an alert points to), `--hashes FILE`. To watch it live: `sudo tail -f "/Library/Application Support/SecEPP/logs/sensord.log"`.
 
 You can also run it by hand to try it out: `sudo build/src/sensord/sec-sensord --console --data-dir /tmp/sec-test`, or feed it recorded events with `--source stdin < events.jsonl`.
 
@@ -146,6 +152,7 @@ Every process accumulates a score and a set of tags, and a child inherits both f
 - When a new stage (persistence, C2, and so on) first shows up on a process chain, it alerts again even if the level didn't change.
 - A rule counts at most once per process.
 - Each rule carries a MITRE ATT&CK technique ID.
+- An alert includes up to 12 recent events of the processes in the chain (`T-3.2s  curl(900)  exec ...`) and, for unsigned or staged executables on the chain, their SHA-256 and the scanner's verdict. If the scanner calls one of them malicious the alert becomes critical.
 
 Features rules can depend on:
 
@@ -200,6 +207,30 @@ An egress allowlist goes in the same file:
 }
 ```
 
+#### Allowlist
+
+Known-good activity can be skipped with an `allowlist` in the same file. A matching entry makes the rule not fire at all, so it adds no score and sets no tag. `sensor_status.txt` counts these as `suppressed`.
+
+```json
+{
+  "allowlist": [
+    {
+      "id": "corp-update-agent",
+      "note": "signed by our team, talks to many hosts",
+      "rules": ["mac.net.*"],
+      "when": { "team_id_any": ["ABCDE12345"] }
+    }
+  ]
+}
+```
+
+- `rules`: rule ids, a trailing `*` makes it a prefix. Leave it out to cover every rule.
+- `event`: optional, `exec|file|net|dns`.
+- `when`: the same conditions as in a rule, plus `team_id_any`, `signing_id_any`, `remote_ip_any` (IP or CIDR) and `remote_host_any` (also matches DNS names). `requires_tag_any` and `requires_feature_any` aren't allowed here.
+- An entry needs at least one of `rules`, `event` or `when`; otherwise it would allow everything and the file is rejected.
+
+`config/behavior_rules.example.json` has more examples. A rule that is allowed for one process can still fire for another, and the other rules on the same event are unaffected.
+
 The IOC file looks like `{"ips": ["203.0.113.0/24"], "hosts": ["*.bad.example"]}`.
 
 ### Checking against eslogger
@@ -217,11 +248,27 @@ If `parse_errors` at the end isn't 0, the parser doesn't match the real output. 
 
 Input can be either eslogger JSON lines or this project's normalized JSONL; the format is detected automatically. For the normalized format, see the comment at the top of `src/behavior/es_parser.h` and the examples in `data/scenarios/`.
 
+## Quick detection test
+
+None of these do anything harmful. Watch `sudo tail -f "/Library/Application Support/SecEPP/logs/sensord.log" | grep --line-buffered ALERT` in another terminal.
+
+```sh
+bash -c 'echo test /dev/tcp/127.0.0.1/9'                          # reverse-shell pattern, warning
+sqlite3 -readonly /tmp/tcc.db "select 1;"                         # TCC database edit, warning
+osascript -e 'return "do shell script with administrator privileges"'   # warning
+curl --limit-rate 100 -s -o /tmp/sec_test.txt https://example.com # download, then connection, warning
+DYLD_INSERT_LIBRARIES=/tmp/none.dylib /usr/bin/true               # 40 points: no alert by itself
+rm -f /tmp/tcc.db /tmp/sec_test.txt
+```
+
+The replay scenarios `c2_chain`, `credential_theft` and `dyld_injection` in `data/scenarios/` show the combined chains without a sensor.
+
 ## Next up
 
 - Run the sensor on a real Mac and fix what breaks (eslogger JSON layout, libproc, permissions)
-- Process signing info for processes that started before the sensor did
-- DNS visibility through a Network Extension
+- DNS visibility through a Network Extension (or at least the unified log)
+- Ship alerts to a SIEM (syslog / JSON file / webhook)
+- Rule regression tests: "this event file must produce exactly these alerts" next to each rule
 - Validate rules against real attack simulations (Atomic Red Team and similar) and cut down false positives
 - Encrypt quarantined files (AES-GCM)
 - Mach-O analysis

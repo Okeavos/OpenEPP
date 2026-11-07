@@ -16,6 +16,7 @@ struct ProcessRef {
     int ppid = 0;
     std::string path;
     std::vector<std::string> args;  // argv (Exec only)
+    std::vector<std::string> env;   // interesting environment entries only ("DYLD_*", "LD_PRELOAD"); Exec only
     std::string signing_id;
     std::string team_id;
     bool platform_binary = false;  // shipped with macOS

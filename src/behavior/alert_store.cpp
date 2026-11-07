@@ -143,13 +143,15 @@ std::string alert_to_tsv(const Alert& a) {
     o += join_list(a.rule_ids) + "\t";
     o += join_list(a.techniques) + "\t";
     o += join_list(a.chain) + "\t";
-    o += escape_field(a.detail);
+    o += escape_field(a.detail) + "\t";
+    o += join_list(a.context) + "\t";
+    o += join_list(a.files);
     return o;
 }
 
 bool alert_from_tsv(const std::string& line, Alert& out) {
     const std::vector<std::string> f = split_tabs(line);
-    if (f.size() != 10) return false;
+    if (f.size() != 10 && f.size() != 12) return false;
     Alert a;
     std::int64_t level = 0, score = 0, pid = 0;
     if (!parse_i64(f[0], a.time_ms) || !parse_i64(f[1], level) || !parse_i64(f[2], score) || !parse_i64(f[3], pid)) {
@@ -165,6 +167,10 @@ bool alert_from_tsv(const std::string& line, Alert& out) {
     a.techniques = split_list(f[7]);
     a.chain = split_list(f[8]);
     a.detail = unescape_field(f[9]);
+    if (f.size() == 12) {
+        a.context = split_list(f[10]);
+        a.files = split_list(f[11]);
+    }
     out = std::move(a);
     return true;
 }
@@ -336,6 +342,8 @@ bool write_status(const fs::path& file, const SensorStatus& s) {
     o << "dropped=" << s.dropped << "\n";
     o << "alerts=" << s.alerts << "\n";
     o << "parse_errors=" << s.parse_errors << "\n";
+    o << "suppressed=" << s.suppressed << "\n";
+    o << "seeded=" << s.seeded << "\n";
     auto one_line = [](std::string v) {
         std::replace(v.begin(), v.end(), '\n', ' ');
         std::replace(v.begin(), v.end(), '\r', ' ');
@@ -369,6 +377,8 @@ std::optional<SensorStatus> read_status(const fs::path& file) {
         else if (k == "dropped" && num) s.dropped = static_cast<std::uint64_t>(n);
         else if (k == "alerts" && num) s.alerts = static_cast<std::uint64_t>(n);
         else if (k == "parse_errors" && num) s.parse_errors = static_cast<std::uint64_t>(n);
+        else if (k == "suppressed" && num) s.suppressed = static_cast<std::uint64_t>(n);
+        else if (k == "seeded" && num) s.seeded = static_cast<std::uint64_t>(n);
         else if (k == "last_error") s.last_error = v;
         else if (k == "rules_error") s.rules_error = v;
     }

@@ -1,0 +1,4 @@
+# A dropped binary in /tmp starts a signed app with DYLD_INSERT_LIBRARIES, then the app talks to the internet.
+{"type":"exec","time_ms":3000000,"pid":700,"ppid":1,"path":"/tmp/launcher","args":["/tmp/launcher"],"signing":"unsigned"}
+{"type":"exec","time_ms":3001000,"pid":701,"ppid":700,"path":"/Applications/Notes.app/Contents/MacOS/Notes","args":["Notes"],"signing":"platform","env":["HOME=/Users/victim","DYLD_INSERT_LIBRARIES=/tmp/hook.dylib"]}
+{"type":"net","time_ms":3005000,"pid":701,"path":"/Applications/Notes.app/Contents/MacOS/Notes","remote_ip":"203.0.113.77","remote_port":443,"signing":"platform"}

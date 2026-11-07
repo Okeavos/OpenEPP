@@ -1,0 +1,31 @@
+{
+  "allowlist": [
+    {
+      "id": "corp-update-agent",
+      "note": "Internal updater: signed by our team, talks to many hosts",
+      "rules": ["mac.net.*"],
+      "when": { "team_id_any": ["ABCDE12345"] }
+    },
+    {
+      "id": "xcode-sanitizers",
+      "note": "Xcode injects its own dylibs while debugging",
+      "rules": ["mac.exec.dyld_insert"],
+      "when": { "ancestor_name_any": ["xcode", "lldb-rpc-server", "debugserver"] }
+    },
+    {
+      "id": "build-farm-curl",
+      "rules": ["mac.exec.downloader_to_tmp"],
+      "when": { "path_prefix_any": ["/opt/build/"], "ancestor_name_any": ["jenkins-agent"] }
+    },
+    {
+      "id": "git-over-ssh-to-corp",
+      "event": "net",
+      "when": { "remote_host_any": ["*.git.corp.example"], "name_any": ["ssh", "git-remote-https"] }
+    },
+    {
+      "id": "lab-network",
+      "rules": ["mac.net.shell_connect"],
+      "when": { "remote_ip_any": ["198.51.100.0/24"] }
+    }
+  ]
+}

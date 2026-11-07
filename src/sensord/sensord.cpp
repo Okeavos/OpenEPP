@@ -7,6 +7,7 @@
 //   sec-sensord [--data-dir DIR] [--rules FILE] [--ioc FILE]
 //               [--source eslogger|stdin|none] [--eslogger PATH] [--events "exec fork ..."]
 //               [--no-sockets] [--poll-ms N] [--console]
+//               [--hashes FILE] [--no-snapshot] [--no-scan] [--verbose]
 
 #include "agent/agent.h"
 #include "behavior/alert_store.h"
@@ -14,7 +15,10 @@
 #include "behavior/rules.h"
 #include "common/log.h"
 #include "common/util.h"
+#include "scanner/scan_engine.h"
+#include "sensor/alert_enricher.h"
 #include "sensor/eslogger_source.h"
+#include "sensor/proc_snapshot.h"
 #include "sensor/sensor_service.h"
 #include "sensor/socket_poller.h"
 #include "behavior/es_parser.h"
@@ -26,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -46,7 +51,8 @@ void usage() {
     std::fputs(
         "usage: sec-sensord [--data-dir DIR] [--rules FILE] [--ioc FILE]\n"
         "                   [--source eslogger|stdin|none] [--eslogger PATH] [--events \"exec fork ...\"]\n"
-        "                   [--no-sockets] [--poll-ms N] [--console]\n",
+        "                   [--no-sockets] [--poll-ms N] [--console]\n"
+        "                   [--hashes FILE] [--no-snapshot] [--no-scan] [--verbose]\n",
         stderr);
 }
 
@@ -58,6 +64,38 @@ bool read_text(const fs::path& p, std::string& out) {
     out = ss.str();
     return true;
 }
+
+// --verbose: one line per processed event, written to <data-dir>/logs/sensord-events.log (truncated at
+// every start, capped in size) and to stdout with --console.
+class EventTrace {
+public:
+    EventTrace(const fs::path& file, bool console) : console_(console) {
+        std::error_code ec;
+        fs::create_directories(file.parent_path(), ec);
+        out_.open(file, std::ios::binary | std::ios::trunc);
+    }
+
+    void write(const behavior::Event& ev, std::size_t alerts) {
+        std::string line = "EV pid=" + std::to_string(ev.proc.pid) + " ppid=" + std::to_string(ev.proc.ppid) + " " +
+                           behavior::event_summary(ev);
+        if (alerts != 0) line += "  => ALERT x" + std::to_string(alerts);
+        line.push_back('\n');
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (console_) std::fputs(line.c_str(), stdout);
+        if (!out_ || bytes_ > kMaxBytes) return;
+        out_ << line;
+        bytes_ += line.size();
+        if (bytes_ > kMaxBytes) out_ << "-- size cap reached; further events are not recorded --\n";
+        out_.flush();
+    }
+
+private:
+    static constexpr std::size_t kMaxBytes = 64u << 20;
+    bool console_;
+    std::ofstream out_;
+    std::size_t bytes_ = 0;
+    std::mutex mutex_;
+};
 
 fs::path default_sensor_dir() {
 #if defined(__APPLE__)
@@ -77,6 +115,10 @@ int main(int argc, char** argv) {
     std::string events = "exec fork exit create rename close";
     bool sockets = true;
     bool console = false;
+    bool verbose = false;
+    bool snapshot = true;
+    bool scan_alerts = true;
+    fs::path hashes_file;
     int poll_ms = 1000;
 
     for (int i = 1; i < argc; ++i) {
@@ -111,6 +153,15 @@ int main(int argc, char** argv) {
             sockets = false;
         } else if (a == "--console") {
             console = true;
+        } else if (a == "--verbose") {
+            verbose = true;
+        } else if (a == "--no-snapshot") {
+            snapshot = false;
+        } else if (a == "--no-scan") {
+            scan_alerts = false;
+        } else if (a == "--hashes") {
+            next(v);
+            hashes_file = util::path_from_utf8(v);
         } else {
             usage();
             return 2;
@@ -173,11 +224,31 @@ int main(int argc, char** argv) {
         }
     }
 
+    ScanEngine scan_engine;
+    {
+        ScanOptions so;
+        so.max_file_size = 64ull << 20;
+        so.max_analyze_size = 32ull << 20;
+        scan_engine.set_options(so);
+        if (hashes_file.empty() && fs::exists(data_dir / "hashes.txt", ec)) hashes_file = data_dir / "hashes.txt";
+        if (!hashes_file.empty()) {
+            const std::size_t n = scan_engine.hash_db().load_file(hashes_file);
+            log::info("hash db: " + std::to_string(n) + " entries from " + util::path_to_utf8(hashes_file));
+        }
+    }
+    sensor::AlertEnricher enricher(&scan_engine);
+
     behavior::AlertLog alert_log(data_dir / "behavior_alerts.tsv");
     sensor::SensorService service(std::move(rules), std::move(ioc), &alert_log, [console](const behavior::Alert& a) {
         log::warn("ALERT " + behavior::alert_to_json(a));
         if (console) std::fputs(behavior::alert_to_text(a).c_str(), stdout);
     });
+    if (scan_alerts) service.set_enricher([&enricher](behavior::Alert& a) { enricher(a); });
+    std::unique_ptr<EventTrace> trace;
+    if (verbose) {
+        trace = std::make_unique<EventTrace>(data_dir / "logs" / "sensord-events.log", console);
+        service.set_event_hook([&trace](const behavior::Event& ev, std::size_t alerts) { trace->write(ev, alerts); });
+    }
     service.start();
 
     std::unique_ptr<sensor::EsloggerSource> es;
@@ -188,6 +259,11 @@ int main(int argc, char** argv) {
         while (words >> w) cmd.push_back(w);
         es = std::make_unique<sensor::EsloggerSource>(std::move(cmd), service);
         es->start();
+    }
+    if (snapshot && (source == "eslogger")) {
+        std::vector<behavior::ProcessRef> running = sensor::snapshot_processes();
+        log::info("process snapshot: " + std::to_string(running.size()) + " running processes registered");
+        service.seed_processes(std::move(running));
     }
 
     std::unique_ptr<sensor::SocketPoller> poller;
@@ -208,6 +284,8 @@ int main(int argc, char** argv) {
         status.events = st.events_processed;
         status.dropped = st.events_dropped;
         status.alerts = st.alerts;
+        status.suppressed = st.suppressed;
+        status.seeded = st.seeded;
         status.eslogger = "disabled";
         status.last_error.clear();
         status.parse_errors = 0;
@@ -221,7 +299,8 @@ int main(int argc, char** argv) {
         behavior::write_status(status_file, status);
     };
 
-    log::info("sec-sensord started (data dir " + util::path_to_utf8(data_dir) + ", source " + source + ")");
+    log::info("sec-sensord started (data dir " + util::path_to_utf8(data_dir) + ", source " + source +
+              (verbose ? ", verbose" : "") + ")");
     publish(false);
 
     if (source == "stdin") {

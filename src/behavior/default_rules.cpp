@@ -147,6 +147,56 @@ const char* const kHead = R"JSON({
       }
     },
     {
+      "id": "mac.exec.dyld_insert",
+      "title": "DYLD_INSERT_LIBRARIES로 라이브러리 주입 시도",
+      "event": "exec", "score": 40, "tag": "defense_evasion", "technique": "T1574.006",
+      "when": { "env_contains_any": ["dyld_insert_libraries="] }
+    },
+    {
+      "id": "mac.exec.browser_data_access",
+      "title": "브라우저 로그인/쿠키/키체인 파일 복사·열람",
+      "event": "exec", "score": 50, "tag": "credential_access", "technique": "T1555.003",
+      "when": {
+        "name_any": ["cp", "ditto", "tar", "zip", "sqlite3", "cat", "rsync", "base64", "python", "python3", "perl", "ruby"],
+        "args_contains_any": ["/default/login data", "/default/cookies", "cookies.sqlite", "logins.json", "key4.db",
+                              "cookies.binarycookies", "/library/keychains/", "login.keychain"]
+      }
+    },
+    {
+      "id": "mac.exec.ssh_key_access",
+      "title": "SSH 개인키 복사·열람",
+      "event": "exec", "score": 30, "tag": "credential_access", "technique": "T1552.004",
+      "when": {
+        "name_any": ["cp", "ditto", "tar", "zip", "cat", "base64", "rsync"],
+        "args_contains_any": ["/.ssh/id_"]
+      }
+    },
+    {
+      "id": "mac.exec.login_hook",
+      "title": "로그인/로그아웃 훅 등록",
+      "event": "exec", "score": 50, "tag": "persistence", "technique": "T1037.002",
+      "when": {
+        "name_any": ["defaults"],
+        "args_all_of_any": [["write"], ["loginhook", "logouthook"]]
+      }
+    },
+    {
+      "id": "mac.exec.base64_shell",
+      "title": "base64로 숨긴 명령을 셸로 실행",
+      "event": "exec", "score": 50, "tag": "defense_evasion", "technique": "T1027",
+      "when": {
+        "name_any": ["sh", "bash", "zsh"],
+        "args_all_of_any": [["base64 -d", "base64 --decode"],
+                            ["| sh", "|sh", "| bash", "|bash", "| zsh", "|zsh"]]
+      }
+    },
+    {
+      "id": "mac.exec.jxa",
+      "title": "JavaScript for Automation(JXA) 실행",
+      "event": "exec", "score": 30, "technique": "T1059.007",
+      "when": { "name_any": ["osascript"], "args_contains_any": ["-l javascript", "-ljavascript"] }
+    },
+    {
       "id": "mac.persist.launchctl_after_staging",
       "title": "의심 활동 이후 launchctl로 서비스 등록",
       "event": "exec", "score": 30, "tag": "persistence", "technique": "T1543.001",
@@ -219,6 +269,25 @@ const char* const kPersistence = R"JSON(
       "event": "file", "score": 40, "tag": "persistence", "technique": "T1547.015",
       "when": {
         "file_path_contains_any": ["/com.apple.backgroundtaskmanagementagent/", "sharedfilelist/com.apple.LSSharedFileList"],
+        "unsigned_process": true
+      }
+    },
+    {
+      "id": "mac.persist.authorized_keys_script",
+      "title": "스크립트/다운로더가 SSH authorized_keys 수정",
+      "event": "file", "score": 40, "tag": "persistence", "technique": "T1098.004",
+      "when": {
+        "file_name_any": ["authorized_keys"],
+        "name_any": ["curl", "wget", "python", "python3", "perl", "ruby", "osascript"]
+      }
+    },
+    {
+      "id": "mac.file.app_bundle_tamper",
+      "title": "서명되지 않은 프로그램이 설치된 앱 번들 내부 수정",
+      "event": "file", "score": 40, "tag": "defense_evasion", "technique": "T1554",
+      "when": {
+        "file_path_prefix_any": ["/applications/"],
+        "file_path_contains_any": [".app/contents/macos/", ".app/contents/frameworks/", ".app/contents/resources/"],
         "unsigned_process": true
       }
     },

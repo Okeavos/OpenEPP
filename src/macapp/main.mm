@@ -373,7 +373,16 @@ NSString* action_label(const std::string& a) {
             if (!a.chain.empty()) [s appendFormat:@"  체인: %@\n", joined(a.chain, @" > ")];
             if (!a.rule_ids.empty()) [s appendFormat:@"  규칙: %@\n", joined(a.rule_ids, @", ")];
             if (!a.techniques.empty()) [s appendFormat:@"  ATT&CK: %@\n", joined(a.techniques, @", ")];
-            [s appendFormat:@"  이벤트: %@\n\n", ns(a.detail)];
+            [s appendFormat:@"  이벤트: %@\n", ns(a.detail)];
+            if (!a.files.empty()) {
+                [s appendString:@"  관련 파일:\n"];
+                for (const auto& f : a.files) [s appendFormat:@"    %@\n", ns(f)];
+            }
+            if (!a.context.empty()) {
+                [s appendString:@"  직전 활동:\n"];
+                for (const auto& c : a.context) [s appendFormat:@"    %@\n", ns(c)];
+            }
+            [s appendString:@"\n"];
         }
     }
 

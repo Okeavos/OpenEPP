@@ -92,9 +92,17 @@ void SensorService::submit(behavior::Event ev) {
     cv_.notify_one();
 }
 
+void SensorService::seed_processes(std::vector<behavior::ProcessRef> procs) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (behavior::ProcessRef& p : procs) pending_seeds_.push_back(std::move(p));
+    }
+    cv_.notify_one();
+}
+
 void SensorService::flush() {
     std::unique_lock<std::mutex> lock(mutex_);
-    idle_cv_.wait(lock, [this] { return (queue_.empty() && !busy_) || !running_; });
+    idle_cv_.wait(lock, [this] { return (queue_.empty() && pending_seeds_.empty() && !busy_) || !running_; });
 }
 
 SensorStats SensorService::stats() const {
@@ -104,23 +112,40 @@ SensorStats SensorService::stats() const {
     s.events_ignored = ignored_;
     s.events_processed = processed_;
     s.alerts = alerts_;
+    s.suppressed = suppressed_;
+    s.seeded = seeded_;
     return s;
 }
 
 void SensorService::run() {
     while (true) {
         behavior::Event ev;
+        std::vector<behavior::ProcessRef> seeds;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
-            if (queue_.empty()) {
+            cv_.wait(lock, [this] { return stop_ || !queue_.empty() || !pending_seeds_.empty(); });
+            if (!pending_seeds_.empty()) {
+                seeds.swap(pending_seeds_);
+                busy_ = true;
+            } else if (queue_.empty()) {
                 idle_cv_.notify_all();
                 if (stop_) return;
                 continue;
+            } else {
+                ev = std::move(queue_.front());
+                queue_.pop_front();
+                busy_ = true;
             }
-            ev = std::move(queue_.front());
-            queue_.pop_front();
-            busy_ = true;
+        }
+
+        if (!seeds.empty()) {
+            const std::int64_t t = std::max(last_time_ms_, behavior::now_ms());
+            for (const behavior::ProcessRef& p : seeds) engine_.seed_process(p, t);
+            seeded_ = engine_.seeded();
+            std::lock_guard<std::mutex> lock(mutex_);
+            busy_ = false;
+            if (queue_.empty() && pending_seeds_.empty()) idle_cv_.notify_all();
+            continue;
         }
 
         // Sensors run on different clocks and threads; the engine expects non-decreasing time.
@@ -130,7 +155,10 @@ void SensorService::run() {
 
         std::vector<behavior::Alert> alerts = engine_.process(ev);
         ++processed_;
-        for (const behavior::Alert& a : alerts) {
+        suppressed_ = engine_.suppressed();
+        if (event_hook_) event_hook_(ev, alerts.size());
+        for (behavior::Alert& a : alerts) {
+            if (enricher_) enricher_(a);
             ++alerts_;
             if (log_ != nullptr && !log_->append(a)) log::error("cannot write alert log");
             if (on_alert_) on_alert_(a);
@@ -139,7 +167,7 @@ void SensorService::run() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             busy_ = false;
-            if (queue_.empty()) idle_cv_.notify_all();
+            if (queue_.empty() && pending_seeds_.empty()) idle_cv_.notify_all();
         }
     }
 }

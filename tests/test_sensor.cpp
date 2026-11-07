@@ -4,7 +4,10 @@
 #include "behavior/es_parser.h"
 #include "behavior/rules.h"
 #include "common/util.h"
+#include "scanner/scan_engine.h"
+#include "sensor/alert_enricher.h"
 #include "sensor/conn_tracker.h"
+#include "sensor/proc_snapshot.h"
 #include "sensor/eslogger_source.h"
 #include "sensor/sensor_service.h"
 #include "sensor/socket_poller.h"
@@ -13,6 +16,7 @@
 #include <fstream>
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include <unistd.h>
 #include <thread>
 
@@ -465,4 +469,147 @@ TEST(eslogger_source_survives_huge_and_broken_lines) {
     CHECK(wait_until([&] { return svc.stats().events_processed >= 1; }));
     src.stop();
     svc.stop();
+}
+
+namespace {
+
+const char kEicar[] = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+
+void write_file(const fs::path& p, const std::string& data) {
+    std::ofstream out(p, std::ios::binary);
+    out << data;
+}
+
+}
+
+TEST(enricher_scans_suspect_files_and_raises_level) {
+    sec_test::TempDir tmp;
+    write_file(tmp.path() / "clean.bin", "just some harmless bytes");
+    write_file(tmp.path() / "bad.bin", std::string("MZ") + kEicar);
+
+    ScanEngine scan;
+    AlertEnricher enrich(&scan);
+
+    Alert a = make_alert(1000, 1, "의심 활동");
+    a.suspect_paths = {util::path_to_utf8(tmp.path() / "clean.bin"), util::path_to_utf8(tmp.path() / "missing.bin")};
+    enrich(a);
+    CHECK(a.files.size() == 2);
+    CHECK(a.level == 1);
+    CHECK(a.files[0].find("sha256:") != std::string::npos);
+    CHECK(a.files[0].find("이상 없음") != std::string::npos);
+    CHECK(a.files[1].find("파일 없음") != std::string::npos);
+
+    Alert b = make_alert(2000, 1, "의심 활동");
+    b.suspect_paths = {util::path_to_utf8(tmp.path() / "bad.bin")};
+    enrich(b);
+    CHECK(b.files.size() == 1);
+    CHECK(b.level == 2);
+    CHECK(b.title.find("스캐너 악성 판정") != std::string::npos);
+    CHECK(b.files[0].find("EICAR") != std::string::npos);
+    CHECK(std::find(b.rule_ids.begin(), b.rule_ids.end(), "scanner.malicious") != b.rule_ids.end());
+
+    Alert c = make_alert(3000);
+    enrich(c);  // nothing to look at
+    CHECK(c.files.empty());
+    AlertEnricher none(nullptr);
+    none(b);  // a null engine is tolerated
+}
+
+TEST(service_enriches_alerts_before_storing_and_reports_hook) {
+    sec_test::TempDir tmp;
+    const fs::path payload = tmp.path() / "payload";
+    write_file(payload, std::string("MZ") + kEicar);
+    const std::string payload_path = util::path_to_utf8(payload);
+
+    RuleSet rs;
+    CHECK(load_ruleset_text(R"({"rules":[
+        {"id":"r.unsigned","title":"unsigned exec","event":"exec","score":100,"when":{"unsigned_process":true}}]})",
+                            rs, nullptr));
+    AlertLog log(tmp.path() / "alerts.tsv");
+    ScanEngine scan;
+    AlertEnricher enrich(&scan);
+
+    std::atomic<int> hook_events{0};
+    std::atomic<int> hook_alerts{0};
+    SensorService svc(std::move(rs), IocSet{}, &log);
+    svc.set_enricher([&enrich](Alert& a) { enrich(a); });
+    svc.set_event_hook([&](const Event&, std::size_t n) {
+        ++hook_events;
+        hook_alerts += static_cast<int>(n);
+    });
+    svc.start();
+
+    const ParseResult r = parse_event_line(normalized_exec(4242, 1, payload_path.c_str(), "unsigned", 1000));
+    CHECK(r.ok());
+    svc.submit(r.event);
+    svc.flush();
+
+    CHECK(hook_events == 1);
+    CHECK(hook_alerts == 1);
+    svc.stop();
+
+    std::ifstream in(tmp.path() / "alerts.tsv");
+    std::string line;
+    CHECK(static_cast<bool>(std::getline(in, line)));
+    Alert stored;
+    CHECK(alert_from_tsv(line, stored));
+    CHECK(stored.level == 2);
+    CHECK(stored.files.size() == 1);
+    if (!stored.files.empty()) CHECK(stored.files[0].find("EICAR") != std::string::npos);
+}
+
+TEST(service_seeds_running_processes_before_later_events) {
+    RuleSet rs;
+    CHECK(load_ruleset_text(R"({"rules":[
+        {"id":"r.unsigned_net","title":"unsigned connects","event":"net","score":100,
+         "when":{"unsigned_process":true,"remote_public":true}}]})",
+                            rs, nullptr));
+    std::mutex m;
+    std::vector<Alert> got;
+    SensorService svc(std::move(rs), IocSet{}, nullptr, [&](const Alert& a) {
+        std::lock_guard<std::mutex> lock(m);
+        got.push_back(a);
+    });
+    svc.start();
+
+    ProcessRef p;
+    p.pid = 5151;
+    p.ppid = 1;
+    p.path = "/opt/old/implant";
+    p.sig_known = true;  // known to be unsigned
+    svc.seed_processes({p});
+
+    // The connection event itself carries no signing information; the seeded state supplies it.
+    Event ev;
+    ev.type = EventType::NetConnect;
+    ev.time_ms = 5000;
+    ev.proc.pid = 5151;
+    ev.proc.path = "/opt/old/implant";
+    ev.remote_ip = "203.0.113.5";
+    ev.remote_port = 443;
+    svc.submit(ev);
+    svc.flush();
+
+    CHECK(svc.stats().seeded == 1);
+    std::lock_guard<std::mutex> lock(m);
+    CHECK(got.size() == 1);
+    svc.stop();
+}
+
+TEST(snapshot_lists_this_process) {
+    const std::vector<ProcessRef> procs = snapshot_processes();
+    CHECK(!procs.empty());
+    const int me = static_cast<int>(::getpid());
+    bool found = false;
+    for (const ProcessRef& p : procs) {
+        if (p.pid != me) continue;
+        found = true;
+        CHECK(!p.path.empty());
+        CHECK(p.ppid > 0);
+        CHECK(!p.args.empty());
+#if defined(__APPLE__)
+        CHECK(p.sig_known);  // the test binary is at least ad-hoc signed by the linker on arm64
+#endif
+    }
+    CHECK(found);
 }
