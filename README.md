@@ -1,5 +1,7 @@
 # Open EndPoint Protection / OpenEPP
 
+# Hong Seong Jin
+
 A C++ endpoint protection tool I'm building with macOS as the main target. It's still a prototype. It does two things:
 
 - **File scanning**: SHA-256 hash lookups, byte-pattern signatures and static PE analysis to find malicious files.
