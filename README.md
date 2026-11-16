@@ -1,6 +1,6 @@
 # Open EndPoint Protection / OpenEPP
 
-# Hong Seong Jin
+## Hong Seong Jin
 
 A C++ endpoint protection tool I'm building with macOS as the main target. It's still a prototype. It does two things:
 
