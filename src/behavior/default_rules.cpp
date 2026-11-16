@@ -369,6 +369,153 @@ const char* const kNetwork = R"JSON(
       "title": "DNS 터널링 형태의 조회",
       "event": "dns", "score": 40, "tag": "c2_candidate", "technique": "T1071.004",
       "when": { "requires_feature_any": ["tunnel_like"] }
+    },
+)JSON";
+
+// AI coding agents. The agent process gets the "ai_agent" tag (score 0), which every child inherits.
+// The rules below only add weight to things an agent rarely needs to do on its own: reading secrets,
+// installing persistence, opening reverse shells, piping a download into a shell. Agent / MCP config
+// files are watched separately, whoever writes them, because an entry there runs on every later session.
+const char* const kAi = R"JSON(
+    {
+      "id": "mac.ai.agent_session",
+      "title": "AI 코딩 에이전트 실행",
+      "event": "exec", "score": 0, "tag": "ai_agent",
+      "when": { "name_any": ["claude", "codex", "gemini", "cursor-agent", "aider", "goose", "opencode", "amp",
+                             "copilot", "crush", "qwen", "cursor", "windsurf", "kiro"] }
+    },
+    {
+      "id": "mac.ai.agent_session_script",
+      "title": "AI 코딩 에이전트 실행 (스크립트 런타임)",
+      "event": "exec", "score": 0, "tag": "ai_agent",
+      "when": {
+        "name_any": ["node", "bun", "deno", "python", "python3"],
+        "args_contains_any": ["@anthropic-ai/claude-code", "@google/gemini-cli", "@openai/codex", "@github/copilot",
+                              "@sourcegraph/amp", "opencode-ai", "@qwen-code/", "/bin/aider", "aider-chat"]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_secret_access",
+      "title": "AI 에이전트 세션에서 인증 정보 파일 접근",
+      "event": "exec", "score": 40, "tag": "credential_access", "technique": "T1552.001", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "name_any": ["cp", "cat", "ditto", "tar", "zip", "base64", "rsync", "scp", "curl", "head", "tail", "less",
+                     "more", "xxd", "strings", "sqlite3", "python", "python3", "node", "grep", "find"],
+        "args_contains_any": [".ssh/id_", ".aws/credentials", ".config/gcloud/", ".kube/config", ".docker/config.json",
+                              ".npmrc", ".pypirc", ".netrc", ".git-credentials", "/library/keychains/",
+                              "/default/login data", "/default/cookies", "cookies.binarycookies", "/.gnupg/",
+                              "wallet.dat", "/exodus/", "electrum/wallets"]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_keychain",
+      "title": "AI 에이전트 세션에서 키체인 비밀번호 조회",
+      "event": "exec", "score": 50, "tag": "credential_access", "technique": "T1555.001", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "name_any": ["security"],
+        "args_contains_any": ["find-generic-password", "find-internet-password", "dump-keychain", "export"]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_pipe_shell",
+      "title": "AI 에이전트 세션에서 원격 스크립트를 셸로 실행",
+      "event": "exec", "score": 40, "technique": "T1059.004", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "name_any": ["sh", "bash", "zsh"],
+        "args_all_of_any": [["curl", "wget"], ["| sh", "|sh", "| bash", "|bash", "| zsh", "|zsh"]]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_reverse_shell",
+      "title": "AI 에이전트 세션에서 리버스 셸 패턴",
+      "event": "exec", "score": 40, "tag": "reverse_shell", "technique": "T1059.004", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "args_contains_any": ["/dev/tcp/", "/dev/udp/", " -e /bin/sh", " -e /bin/bash", "exec:/bin/", "pty.spawn("]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_upload",
+      "title": "AI 에이전트 세션에서 파일을 외부로 업로드",
+      "event": "exec", "score": 30, "technique": "T1567", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "name_any": ["curl"],
+        "args_contains_any": [" -t ", "--upload-file", " -f @", "--form ", "--data-binary @", " -d @", "--data @"]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_gatekeeper",
+      "title": "AI 에이전트 세션에서 Gatekeeper/격리 속성 해제",
+      "event": "exec", "score": 30, "tag": "defense_evasion", "technique": "T1553.001", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "name_any": ["xattr", "spctl"],
+        "args_contains_any": ["com.apple.quarantine", "--master-disable", "--global-disable", "--disable"]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_launchd",
+      "title": "AI 에이전트 세션에서 LaunchAgent/LaunchDaemon 생성",
+      "event": "file", "score": 60, "tag": "persistence", "technique": "T1543.001", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "file_path_contains_any": ["/library/launchagents/", "/library/launchdaemons/"]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_shell_rc",
+      "title": "AI 에이전트 세션에서 셸 시작 파일 수정",
+      "event": "file", "score": 30, "tag": "persistence", "technique": "T1546.004", "window_s": 86400,
+      "when": {
+        "requires_tag_any": ["ai_agent"],
+        "file_name_any": [".zshrc", ".zprofile", ".zshenv", ".zlogin", ".bashrc", ".bash_profile", ".profile"]
+      }
+    },
+    {
+      "id": "mac.ai.agent_child_unsigned_net",
+      "title": "AI 에이전트 세션에서 서명되지 않은 프로그램이 외부와 통신",
+      "event": "net", "score": 20, "technique": "T1071", "window_s": 86400,
+      "when": { "requires_tag_any": ["ai_agent"], "unsigned_process": true, "remote_public": true }
+    },
+    {
+      "id": "mac.ai.config_suspicious_content",
+      "title": "AI 에이전트/MCP 설정에 위험한 실행 항목",
+      "event": "file", "score": 60, "tag": "persistence", "technique": "T1546",
+      "when": { "requires_feature_any": ["agent_config_suspicious"] }
+    },
+    {
+      "id": "mac.ai.config_by_unsigned",
+      "title": "서명되지 않은 프로그램이 AI 에이전트/MCP 설정 변경",
+      "event": "file", "score": 50, "tag": "persistence", "technique": "T1546",
+      "when": { "requires_feature_any": ["ai_agent_config"], "unsigned_process": true }
+    },
+    {
+      "id": "mac.ai.config_by_downloader",
+      "title": "다운로더/스크립트 도구가 AI 에이전트/MCP 설정 변경",
+      "event": "file", "score": 60, "tag": "persistence", "technique": "T1546",
+      "when": {
+        "requires_feature_any": ["ai_agent_config"],
+        "name_any": ["curl", "wget", "osascript", "base64", "nc", "ncat"]
+      }
+    },
+    {
+      "id": "mac.ai.config_by_install_script",
+      "title": "패키지 설치 스크립트가 AI 에이전트/MCP 설정 변경",
+      "event": "file", "score": 50, "tag": "persistence", "technique": "T1195.002",
+      "when": {
+        "requires_feature_any": ["ai_agent_config"],
+        "ancestor_name_any": ["npm", "npx", "pnpm", "yarn", "pip", "pip3", "uv", "bun", "gem", "cargo"]
+      }
+    },
+    {
+      "id": "mac.ai.config_after_staging",
+      "title": "의심 활동 이후 AI 에이전트/MCP 설정 변경",
+      "event": "file", "score": 40, "tag": "persistence", "technique": "T1546",
+      "when": { "requires_feature_any": ["ai_agent_config"], "requires_tag_any": ["staged", "initial_access"] }
     }
   ]
 }
@@ -378,10 +525,11 @@ const char* const kNetwork = R"JSON(
 
 std::string default_rules_json() {
     std::string s;
-    s.reserve(24000);
+    s.reserve(36000);
     s += kHead;
     s += kPersistence;
     s += kNetwork;
+    s += kAi;
     return s;
 }
 

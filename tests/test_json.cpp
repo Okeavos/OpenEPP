@@ -66,3 +66,52 @@ TEST(json_large_integers) {
     CHECK((*v)[0].as_int() == 9007199254740993LL);
     CHECK((*v)[2].as_int() == 123456789012LL);
 }
+
+TEST(json_integer_edges_without_temporaries) {
+    const auto v = json::parse(R"([0,-0,9223372036854775807,-9223372036854775808,9223372036854775808,-12,1e3,1.5,-2.5e-1])");
+    CHECK(v.has_value());
+    if (!v) return;
+    const auto& a = v->items();
+    CHECK(a.size() == 9);
+    CHECK(a[0].as_int() == 0);
+    CHECK(a[1].as_int() == 0);
+    CHECK(a[2].as_int() == INT64_MAX);
+    CHECK(a[3].as_int() == INT64_MIN);
+    CHECK(a[4].as_double() > 9.2e18);  // too large for int64: falls back to double
+    CHECK(a[5].as_int() == -12);
+    CHECK(a[6].as_double() == 1000.0);
+    CHECK(a[7].as_double() == 1.5);
+    CHECK(a[8].as_double() == -0.25);
+    CHECK(!json::parse("-").has_value());
+    CHECK(!json::parse("1.2.3x").has_value());
+    CHECK(!json::parse("[1,]").has_value());
+}
+
+TEST(json_skip_keys_and_duplicates) {
+    const json::ParseOptions opts{{"stat", "junk"}};
+    const char* text =
+        R"({"a":1,"stat":{"x":[1,2,{"y":"}]\"{"}],"z":"\\"},"b":"keep","junk":"s\"tr","c":[{"stat":5,"d":2}],"a":3})";
+    const auto v = json::parse(text, nullptr, opts);
+    CHECK(v.has_value());
+    if (!v) return;
+    CHECK(v->find("stat") == nullptr);
+    CHECK(v->find("junk") == nullptr);
+    CHECK((*v)["b"].as_string() == "keep");
+    CHECK((*v)["a"].as_int() == 3);  // duplicate key: last wins
+    CHECK((*v)["c"][0].find("stat") == nullptr);
+    CHECK((*v)["c"][0]["d"].as_int() == 2);
+
+    const auto plain = json::parse(text);
+    CHECK(plain.has_value() && (*plain)["stat"].is_object());
+
+    std::string err;
+    CHECK(!json::parse(R"({"stat":{"x":"unterminated})", &err, opts).has_value());
+    CHECK(!err.empty());
+    CHECK(!json::parse(R"({"stat":[[[[)", nullptr, opts).has_value());
+    CHECK(!json::parse(R"({"stat":1 "b":2})", nullptr, opts).has_value());
+    std::string deep = R"({"stat":)";
+    for (int i = 0; i < 100; ++i) deep += "[";
+    for (int i = 0; i < 100; ++i) deep += "]";
+    deep += "}";
+    CHECK(!json::parse(deep, nullptr, opts).has_value());
+}

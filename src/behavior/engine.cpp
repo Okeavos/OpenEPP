@@ -1,5 +1,6 @@
 #include "behavior/engine.h"
 
+#include "behavior/agent_config.h"
 #include "behavior/net_util.h"
 #include "common/util.h"
 
@@ -23,26 +24,29 @@ constexpr std::size_t kMaxSuspects = 4;
 
 std::string lc(const std::string& s) { return util::to_lower(s); }
 
-bool starts_with(const std::string& s, const std::string& p) { return s.compare(0, p.size(), p) == 0; }
+bool starts_with(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
-bool contains(const std::string& s, const std::string& sub) { return s.find(sub) != std::string::npos; }
+bool contains(std::string_view s, std::string_view sub) { return s.find(sub) != std::string_view::npos; }
 
-bool contains_any(const std::string& s, const std::vector<std::string>& subs) {
+bool contains_any(std::string_view s, const std::vector<std::string>& subs) {
     for (const std::string& x : subs) {
         if (contains(s, x)) return true;
     }
     return false;
 }
 
-bool prefix_any(const std::string& s, const std::vector<std::string>& ps) {
+bool prefix_any(std::string_view s, const std::vector<std::string>& ps) {
     for (const std::string& p : ps) {
         if (starts_with(s, p)) return true;
     }
     return false;
 }
 
-bool equals_any(const std::string& s, const std::vector<std::string>& xs) {
-    return std::find(xs.begin(), xs.end(), s) != xs.end();
+bool equals_any(std::string_view s, const std::vector<std::string>& xs) {
+    for (const std::string& x : xs) {
+        if (x == s) return true;
+    }
+    return false;
 }
 
 bool is_build_tool(const std::string& name) {
@@ -71,14 +75,6 @@ RuleEvent rule_event_of(EventType t) {
     }
 }
 
-std::string join_args(const std::vector<std::string>& args) {
-    std::string out;
-    for (const std::string& a : args) {
-        if (!out.empty()) out.push_back(' ');
-        out += a;
-    }
-    return out;
-}
 
 std::string json_escape(const std::string& s) {
     std::string o;
@@ -145,7 +141,12 @@ std::string describe_event(const Event& ev) {
         case EventType::Exec:
             d = "exec " + ev.proc.path;
             if (ev.proc.args.size() > 1) {
-                d += " [" + join_args(std::vector<std::string>(ev.proc.args.begin() + 1, ev.proc.args.end())) + "]";
+                d += " [";
+                for (std::size_t i = 1; i < ev.proc.args.size() && d.size() <= kMax; ++i) {
+                    if (i != 1) d.push_back(' ');
+                    d += ev.proc.args[i];
+                }
+                d += "]";
             }
             break;
         case EventType::FileCreate: d = "create " + ev.file_path; break;
@@ -225,9 +226,43 @@ std::string alert_to_text(const Alert& a) {
 
 Engine::Engine(RuleSet rules) : rules_(std::move(rules)) {
     for (std::size_t i = 0; i < rules_.rules.size(); ++i) {
-        rule_index_[rules_.rules[i].id] = i;
-        rules_by_event_[static_cast<int>(rules_.rules[i].event)].push_back(i);
+        const Rule& r = rules_.rules[i];
+        rule_index_[r.id] = i;
+        const int e = static_cast<int>(r.event);
+        rules_by_event_[e].push_back(i);
+        if (r.when.name_any.empty()) {
+            indexed_[e].generic.push_back(i);
+        } else {
+            for (const std::string& n : r.when.name_any) {
+                std::vector<std::size_t>& v = indexed_[e].by_name[n];
+                if (v.empty() || v.back() != i) v.push_back(i);
+            }
+        }
     }
+    chain_buf_.reserve(16);
+}
+
+void Engine::candidates_for(RuleEvent e, const std::string& name, std::vector<std::size_t>& out) const {
+    const EventRules& er = indexed_[static_cast<int>(e)];
+    out.clear();
+    const auto it = er.by_name.find(name);
+    if (it == er.by_name.end()) {
+        out = er.generic;
+        return;
+    }
+    out.resize(er.generic.size() + it->second.size());
+    std::merge(er.generic.begin(), er.generic.end(), it->second.begin(), it->second.end(), out.begin());
+}
+
+bool Engine::test_hit(const ProcNode& n, std::size_t idx) const {
+    const std::size_t w = idx / 64;
+    return w < n.hit_bits.size() && (n.hit_bits[w] >> (idx % 64) & 1u) != 0;
+}
+
+void Engine::set_hit(ProcNode& n, std::size_t idx) const {
+    const std::size_t w = idx / 64;
+    if (n.hit_bits.size() <= w) n.hit_bits.resize(w + 1, 0);
+    n.hit_bits[w] |= std::uint64_t{1} << (idx % 64);
 }
 
 void Engine::note_file_write(const Event& ev, const ProcNode& node) {
@@ -283,7 +318,7 @@ bool Engine::egress_violation(const Event& ev, const ProcNode& node, const EvalC
     if (!pol.enabled || ev.remote_ip.empty() || net::is_private_or_local(ev.remote_ip)) return false;
 
     auto process_matches = [&](const std::string& key) {
-        if (!key.empty() && key[0] == '/') return starts_with(ctx.path, lc(key));
+        if (!key.empty() && key[0] == '/') return starts_with(ctx.path, std::string_view(lc(key)));
         return key == node.name;
     };
 
@@ -318,7 +353,7 @@ bool Engine::egress_violation(const Event& ev, const ProcNode& node, const EvalC
     return true;
 }
 
-std::vector<std::string> Engine::compute_features(const Event& ev, const ProcNode& node, const EvalCtx& ctx) {
+std::vector<std::string> Engine::compute_features(const Event& ev, const ProcNode& node, EvalCtx& ctx) {
     std::vector<std::string> f;
     switch (ev.type) {
         case EventType::Exec: {
@@ -340,6 +375,17 @@ std::vector<std::string> Engine::compute_features(const Event& ev, const ProcNod
             if (net::looks_like_dga(ev.dns_name)) f.push_back("dga_like");
             if (net::looks_like_tunnel(ev.dns_name)) f.push_back("tunnel_like");
             break;
+        case EventType::FileCreate:
+        case EventType::FileModify:
+        case EventType::FileRename:
+            if (!ctx.file_path.empty() && is_agent_config_path(ctx.file_path)) {
+                f.push_back("ai_agent_config");
+                if (inspector_) {
+                    ctx.findings = inspector_(ev.file_path);
+                    if (!ctx.findings.empty()) f.push_back("agent_config_suspicious");
+                }
+            }
+            break;
         default:
             break;
     }
@@ -354,13 +400,16 @@ bool Engine::match_cond(const Condition& c, int rule_window_s, const ProcNode& n
     if (!c.path_prefix_any.empty() && !prefix_any(ctx.path, c.path_prefix_any)) return false;
     if (!c.path_contains_any.empty() && !contains_any(ctx.path, c.path_contains_any)) return false;
     if (!c.path_not_prefix_any.empty() && prefix_any(ctx.path, c.path_not_prefix_any)) return false;
-    if (!c.parent_name_any.empty() && (!ctx.has_parent || !equals_any(ctx.parent_name, c.parent_name_any))) return false;
+    if (!c.parent_name_any.empty()) {
+        if (ctx.chain == nullptr || ctx.chain->size() < 2 || !equals_any((*ctx.chain)[1]->name, c.parent_name_any)) {
+            return false;
+        }
+    }
     if (!c.ancestor_name_any.empty()) {
         bool found = false;
-        for (const std::string& a : ctx.ancestors) {
-            if (equals_any(a, c.ancestor_name_any)) {
-                found = true;
-                break;
+        if (ctx.chain != nullptr) {
+            for (std::size_t i = 1; i < ctx.chain->size() && !found; ++i) {
+                found = equals_any((*ctx.chain)[i]->name, c.ancestor_name_any);
             }
         }
         if (!found) return false;
@@ -491,6 +540,12 @@ std::vector<Alert> Engine::process(const Event& ev) {
                     n.team_id = parent->team_id;
                     n.platform_binary = parent->platform_binary;
                     n.sig_known = parent->sig_known;
+                    n.env = parent->env;
+                    n.lpath = parent->lpath;
+                    n.lcmd = parent->lcmd;
+                    n.lteam = parent->lteam;
+                    n.lsigning = parent->lsigning;
+                    n.lenv = parent->lenv;
                 }
             }
             return out;
@@ -516,17 +571,29 @@ std::vector<Alert> Engine::process(const Event& ev) {
         note_file_write(ev, *node);
     }
 
-    recent_.push_back(Recent{now, node->pid, node->ppid, pid_label(*node) + "  " + describe_event(ev)});
-    if (recent_.size() > kRecentKeep) recent_.pop_front();
+    {
+        Recent r{now, node->pid, node->ppid, std::string()};
+        const std::string desc = describe_event(ev);
+        r.text.reserve(node->name.size() + desc.size() + 16);
+        r.text += node->name.empty() ? std::string_view("?") : std::string_view(node->name);
+        r.text += '(';
+        r.text += std::to_string(node->pid);
+        r.text += ")  ";
+        r.text += desc;
+        if (recent_.size() >= kRecentKeep) recent_.pop_front();
+        recent_.push_back(std::move(r));
+    }
 
     EvalCtx ctx;
-    ctx.path = lc(node->path);
-    ctx.team_id = lc(node->team_id);
-    ctx.signing_id = lc(node->signing_id);
-    ctx.env = lc(join_args(node->env));
-    ctx.remote_ip = ev.remote_ip;
-    ctx.host = lc(ev.type == EventType::DnsQuery ? ev.dns_name : ev.remote_host);
-    ctx.cmdline = lc(node->args.empty() ? node->path : join_args(node->args));
+    ctx.path = node->lpath;
+    ctx.team_id = node->lteam;
+    ctx.signing_id = node->lsigning;
+    ctx.env = node->lenv;
+    ctx.cmdline = node->lcmd;
+    if (ev.type == EventType::NetConnect || ev.type == EventType::DnsQuery) {
+        ctx.remote_ip = ev.remote_ip;
+        ctx.host = lc(ev.type == EventType::DnsQuery ? ev.dns_name : ev.remote_host);
+    }
     ctx.file_path = lc(ev.file_path);
     if (!ctx.file_path.empty()) {
         const std::size_t slash = ctx.file_path.find_last_of('/');
@@ -538,28 +605,24 @@ std::vector<Alert> Engine::process(const Event& ev) {
         ctx.remote_port = ev.remote_port;
         ctx.remote_public = !ev.remote_ip.empty() && !net::is_private_or_local(ev.remote_ip);
     }
-    const std::vector<const ProcNode*> chain = tree_.chain(node->pid, 16);
-    for (std::size_t i = 1; i < chain.size(); ++i) {
-        ctx.ancestors.push_back(chain[i]->name);
-        if (i == 1) {
-            ctx.has_parent = true;
-            ctx.parent_name = chain[i]->name;
-        }
-    }
+    tree_.chain_into(node->pid, 16, chain_buf_);
+    const std::vector<const ProcNode*>& chain = chain_buf_;
+    ctx.chain = &chain;
     ctx.features = compute_features(ev, *node, ctx);
 
     // Phase 1: rules that do not depend on tags; phase 2: rules that need a tag, so a tag set by a
     // phase-1 rule on this same event is already visible.
     bool fired_any = false;
     bool new_stage = false;
-    const std::vector<std::size_t>& candidates = rules_by_event_[static_cast<int>(rule_event_of(ev.type))];
+    candidates_for(rule_event_of(ev.type), node->name, cand_buf_);
+    const std::vector<std::size_t>& candidates = cand_buf_;
     for (int phase = 1; phase <= 2; ++phase) {
         for (const std::size_t idx : candidates) {
             const Rule& r = rules_.rules[idx];
             if (!r.enabled) continue;
             const bool tag_rule = !r.when.requires_tag_any.empty();
             if ((phase == 2) != tag_rule) continue;
-            if (node->hit_ids.count(r.id) != 0) continue;
+            if (test_hit(*node, idx)) continue;
             if (!match_cond(r.when, r.window_s, *node, ctx, now)) continue;
             if (!rules_.allowlist.empty() && is_allowed(r, *node, ctx, now)) {
                 ++suppressed_;
@@ -567,6 +630,7 @@ std::vector<Alert> Engine::process(const Event& ev) {
             }
 
             node->hit_ids.insert(r.id);
+            set_hit(*node, idx);
             node->hits.push_back(r.id);
             node->score += r.score;
             if (!r.tag.empty()) {
@@ -589,6 +653,10 @@ std::vector<Alert> Engine::process(const Event& ev) {
     a.pid = node->pid;
     a.process_path = node->path;
     a.detail = describe_event(ev);
+    if (!ctx.findings.empty()) {
+        a.detail += " | 설정 검사:";
+        for (std::size_t i = 0; i < ctx.findings.size(); ++i) a.detail += (i == 0 ? " " : "; ") + ctx.findings[i];
+    }
 
     std::set<std::string> seen_rules;
     std::set<std::string> seen_tech;

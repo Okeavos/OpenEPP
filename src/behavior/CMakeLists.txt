@@ -7,6 +7,7 @@ add_library(sec_behavior STATIC
     engine.cpp
     es_parser.cpp
     alert_store.cpp
+    agent_config.cpp
 )
 target_link_libraries(sec_behavior PUBLIC sec_common)
 target_include_directories(sec_behavior PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

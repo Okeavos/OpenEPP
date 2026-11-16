@@ -41,6 +41,8 @@ public:
 
     // Both must be set before start().
     void set_enricher(Enricher e) { enricher_ = std::move(e); }
+    // Must be set before start(); see behavior::Engine::set_file_inspector.
+    void set_file_inspector(behavior::Engine::FileInspector f) { engine_.set_file_inspector(std::move(f)); }
     void set_event_hook(EventHook h) { event_hook_ = std::move(h); }
 
     void start();

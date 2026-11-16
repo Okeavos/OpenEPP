@@ -15,6 +15,7 @@
 #include "behavior/rules.h"
 #include "common/log.h"
 #include "common/util.h"
+#include "behavior/agent_config.h"
 #include "scanner/scan_engine.h"
 #include "sensor/alert_enricher.h"
 #include "sensor/eslogger_source.h"
@@ -244,6 +245,7 @@ int main(int argc, char** argv) {
         if (console) std::fputs(behavior::alert_to_text(a).c_str(), stdout);
     });
     if (scan_alerts) service.set_enricher([&enricher](behavior::Alert& a) { enricher(a); });
+    service.set_file_inspector(behavior::inspect_agent_config_file);
     std::unique_ptr<EventTrace> trace;
     if (verbose) {
         trace = std::make_unique<EventTrace>(data_dir / "logs" / "sensord-events.log", console);

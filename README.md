@@ -14,7 +14,8 @@ The project started as a file scanner. A lot of real attacks are easier to catch
 - macOS menu bar app: an icon shows the state, and clicking it opens a list of detections
 - Real-time folder watching (FSEvents) on Downloads, Desktop and Documents by default
 - Hash DB, signature and PE heuristic scanning, plus quarantine
-- Behavior engine with about 43 built-in rules, extendable or overridable with JSON, plus an allowlist for known-good activity
+- Behavior engine with about 60 built-in rules, extendable or overridable with JSON, plus an allowlist for known-good activity
+- AI coding agent coverage: risky actions inside an agent's session weigh more, and agent / MCP config files are inspected when they change
 - Alerts carry the recent activity of the process chain, and the files involved are hashed and run through the file scanner
 - `behavior-replay`, a command that feeds recorded events through the engine
 - `sec-sensord`, a root daemon that collects live events (eslogger + TCP socket polling), runs the engine and writes alerts
@@ -38,7 +39,7 @@ The project started as a file scanner. A lot of real attacks are easier to catch
 src/common     SHA-256 (own implementation), logging, config, JSON parser, utilities
 src/scanner    hash DB, PE analysis, scan engine, quarantine
 src/agent      agent core, real-time scan queue, detection store
-src/behavior   behavior detection: event model, process tree, rule engine, eslogger parser, alert store
+src/behavior   behavior detection: event model, process tree, rule engine, eslogger parser, alert store, agent config checks
 src/sensor     live sensors: sensor service, eslogger runner, socket polling, start-up process snapshot, alert enricher (non-Windows)
 src/sensord    sec-sensord daemon
 src/monitor    FSEvents file watcher (macOS only)
@@ -69,7 +70,7 @@ This produces `sec-cli`, `sec-agentd`, `sec-sensord` and `sec-menubar`. If CMake
 
 The core also builds on Linux with the same commands (without the menu bar app and FSEvents). Windows should work with Visual Studio and CMake, but I haven't tested it as much as macOS.
 
-On Linux the test suite (1300 checks) passes under ASan/UBSan and TSan. I haven't run the behavior tests on a Mac yet.
+On Linux the test suite (1500 checks) passes under ASan/UBSan and TSan. I haven't run the behavior tests on a Mac yet.
 
 ## Menu bar app
 
@@ -95,6 +96,7 @@ sec-cli hash <file>
 sec-cli pe <file.exe>
 sec-cli quarantine list
 sec-cli quarantine restore <id>
+sec-cli behavior-bench               # engine / parser throughput
 ```
 
 ### How files are scanned
@@ -171,7 +173,24 @@ build/src/cli/sec-cli behavior-replay data/scenarios/benign_dev.jsonl
 
 The first is a simulated intrusion → persistence → C2 chain and produces several warning and critical alerts. The second is ordinary developer activity (compiling, running the result, using curl) and should produce none. It's there as a false-positive check.
 
-Options: `--rules <file>`, `--ioc <file>`, `--json`. Pass `-` to read from stdin.
+`agent_hijack` and `benign_agent` do the same for an AI coding agent session (see below).
+
+Options: `--rules <file>`, `--ioc <file>`, `--json`, `--no-inspect` (don't open agent config files named in the events). Pass `-` to read from stdin.
+
+### AI coding agents
+
+Agents like Claude Code, Codex, Gemini CLI or Cursor run commands with the developer's own rights. When one is steered by injected instructions (an issue, a log entry, a file in a cloned repo, a poisoned MCP tool result), everything it runs is a signed, ordinary tool, so a classic "is this binary bad" check sees nothing. Two things help:
+
+**Who asked.** The agent process gets an `ai_agent` tag with no score, and every child inherits it (for 24 hours). Normal agent work (git, tests, grep, editing files, fetching package metadata) stays at zero. A handful of rules only add weight inside an agent session: reading credential files (`~/.aws/credentials`, SSH keys, `.npmrc`, browser login data, wallets), `security find-generic-password`, piping a download into a shell, reverse-shell patterns, uploading files with curl, stripping the quarantine attribute, writing a LaunchAgent or a shell rc file. Reading a secret and then uploading it from the same session is a warning; an agent writing a LaunchAgent is a warning on its own.
+
+Agents are recognised by binary name (`claude`, `codex`, `gemini`, `cursor-agent`, `aider`, ...) or, for npm installs where the process is `node`, by the package path in the arguments. If your team uses one that isn't listed, add a rule with `"score": 0, "tag": "ai_agent"`.
+
+**What changed in the config.** Writes to agent and MCP config files are checked whoever makes them: `.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `~/.claude.json`, `~/.claude/settings*.json`, `claude_desktop_config.json`, `~/.gemini/settings.json`, `~/.codex/config.toml`, and the instruction files `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.cursor/rules/*.mdc`.
+
+- The sensor reads the file (up to 1 MB) and looks for MCP servers or hooks that run `sh -c`, curl/wget, base64-decoded commands, reverse shells or binaries from `/tmp` or Downloads; plain-HTTP remote MCP servers; `DYLD_INSERT_LIBRARIES` / `NODE_OPTIONS --require` in a server's env; API base URLs or proxies pointed at an unknown host; `bypassPermissions`, `Bash(*)`, `enableAllProjectMcpServers`; Codex `danger-full-access` / `approval_policy = "never"`. Instruction files are checked for invisible Unicode (zero-width, bidi, tag characters), "ignore previous instructions" and commands hidden in HTML comments. Any finding is a warning and the findings are listed in the alert.
+- Independently of the content, the write itself scores when it comes from an unsigned program, from curl/wget/osascript, from a package install script (anything under npm, pip, yarn, uv, ...), or after a staging step.
+
+Limits: the content check happens when eslogger reports the write, so a file that is changed and then reverted between two writes can be missed. Symlink tricks (an approved path that points somewhere else) aren't detected yet. Teams that edit these files with their own tooling may need an allowlist entry for `mac.ai.config_*`.
 
 ### Writing rules
 
@@ -263,9 +282,22 @@ rm -f /tmp/tcc.db /tmp/sec_test.txt
 
 The replay scenarios `c2_chain`, `credential_theft` and `dyld_injection` in `data/scenarios/` show the combined chains without a sensor.
 
+## Performance
+
+`sec-cli behavior-bench` generates about a million events of ordinary activity and times the engine and both parsers. On a Linux VM (Release build):
+
+| | before | now |
+|---|---|---|
+| engine, per event | 2.5 µs | 1.5 µs |
+| normalized JSONL, per line | 1.85 µs | 1.3 µs |
+| eslogger-sized line (~4 KB), per line | 41 µs | 19 µs |
+
+The engine has 16 more rules than before and is still faster. What changed: lowercase copies of path, command line and signing info are cached per process instead of being rebuilt on every event; the ancestor chain is built into a reused buffer without a hash set; rules are pre-indexed by process name so an event only looks at rules that can match; "has this rule already fired" is a bit test instead of a string set lookup. The JSON parser now parses in place (no `std::optional<Value>` per node), copies string runs at once, parses integers without a temporary string, and the eslogger parser skips members it never reads (`stat`, audit tokens, `tty`, `cwd`, ...). The same benchmark produces zero alerts, which doubles as a false-positive check.
+
 ## Next up
 
 - Run the sensor on a real Mac and fix what breaks (eslogger JSON layout, libproc, permissions)
+- AI agents: symlink checks for agent config paths, outbound traffic to LLM APIs from processes that aren't agents or browsers, local model runtimes (Ollama, llama.cpp) started by unsigned programs
 - DNS visibility through a Network Extension (or at least the unified log)
 - Ship alerts to a SIEM (syslog / JSON file / webhook)
 - Rule regression tests: "this event file must produce exactly these alerts" next to each rule

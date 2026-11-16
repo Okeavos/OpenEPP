@@ -1,7 +1,9 @@
 #include "common/json.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 namespace sec::json {
 
@@ -93,26 +95,32 @@ void Value::set(std::string key, Value v) {
     items_.push_back(std::move(v));
 }
 
-namespace {
+namespace detail {
 
 constexpr int kMaxDepth = 64;
 
+// Parses straight into the destination Value (no std::optional or temporary per element), which
+// matters for eslogger lines: several KB of nested objects per event.
 class Parser {
 public:
-    explicit Parser(std::string_view text) : s_(text) {}
+    explicit Parser(std::string_view text, const ParseOptions* opts = nullptr) : s_(text), opts_(opts) {}
 
     std::optional<Value> run(std::string* error) {
+        Value out;
         skip_ws();
-        auto v = parse_value(0);
-        if (v) {
+        bool ok = parse_value(0, out);
+        if (ok) {
             skip_ws();
             if (pos_ != s_.size()) {
                 fail("unexpected trailing characters");
-                v.reset();
+                ok = false;
             }
         }
-        if (!v && error != nullptr) *error = error_ + " at offset " + std::to_string(pos_);
-        return v;
+        if (!ok) {
+            if (error != nullptr) *error = error_ + " at offset " + std::to_string(pos_);
+            return std::nullopt;
+        }
+        return out;
     }
 
 private:
@@ -136,37 +144,47 @@ private:
         return false;
     }
 
-    std::optional<Value> parse_value(int depth) {
+    bool parse_value(int depth, Value& out) {
         if (depth > kMaxDepth) {
             fail("nesting too deep");
-            return std::nullopt;
+            return false;
         }
         if (pos_ >= s_.size()) {
             fail("unexpected end of input");
-            return std::nullopt;
+            return false;
         }
         const char c = s_[pos_];
-        if (c == '{') return parse_object(depth);
-        if (c == '[') return parse_array(depth);
+        if (c == '{') return parse_object(depth, out);
+        if (c == '[') return parse_array(depth, out);
         if (c == '"') {
-            std::string str;
-            if (!parse_string(str)) return std::nullopt;
-            return Value::make_string(std::move(str));
+            out.type_ = Value::Type::String;
+            return parse_string(out.string_);
         }
         if (c == 't') {
-            if (consume_literal("true")) return Value::make_bool(true);
+            if (consume_literal("true")) {
+                out.type_ = Value::Type::Bool;
+                out.bool_ = true;
+                return true;
+            }
         } else if (c == 'f') {
-            if (consume_literal("false")) return Value::make_bool(false);
+            if (consume_literal("false")) {
+                out.type_ = Value::Type::Bool;
+                out.bool_ = false;
+                return true;
+            }
         } else if (c == 'n') {
-            if (consume_literal("null")) return Value();
+            if (consume_literal("null")) {
+                out.type_ = Value::Type::Null;
+                return true;
+            }
         } else if (c == '-' || (c >= '0' && c <= '9')) {
-            return parse_number();
+            return parse_number(out);
         }
         fail("invalid value");
-        return std::nullopt;
+        return false;
     }
 
-    std::optional<Value> parse_number() {
+    bool parse_number(Value& out) {
         const std::size_t start = pos_;
         bool is_int = true;
         if (s_[pos_] == '-') ++pos_;
@@ -184,25 +202,56 @@ private:
         }
         if (!digits) {
             fail("invalid number");
-            return std::nullopt;
+            return false;
         }
-        const std::string tok(s_.substr(start, pos_ - start));
-        errno = 0;
+        const std::string_view tok = s_.substr(start, pos_ - start);
+        out.type_ = Value::Type::Number;
         if (is_int) {
-            char* end = nullptr;
-            const long long i = std::strtoll(tok.c_str(), &end, 10);
-            if (errno == 0 && end == tok.c_str() + tok.size()) {
-                return Value::make_number(static_cast<double>(i), true, static_cast<std::int64_t>(i));
+            // Integers (pids, timestamps) are the common case: parse without a temporary string.
+            const bool neg = tok[0] == '-';
+            std::uint64_t mag = 0;
+            bool overflow = false;
+            for (std::size_t i = neg ? 1 : 0; i < tok.size(); ++i) {
+                const std::uint64_t d = static_cast<std::uint64_t>(tok[i] - '0');
+                if (mag > (UINT64_MAX - d) / 10) {
+                    overflow = true;
+                    break;
+                }
+                mag = mag * 10 + d;
             }
-            errno = 0;
+            const std::uint64_t limit = neg ? (std::uint64_t{1} << 63) : (std::uint64_t{1} << 63) - 1;
+            if (!overflow && mag <= limit) {
+                const std::int64_t i =
+                    neg ? (mag == (std::uint64_t{1} << 63) ? INT64_MIN : -static_cast<std::int64_t>(mag))
+                        : static_cast<std::int64_t>(mag);
+                out.is_int_ = true;
+                out.int_ = i;
+                out.double_ = static_cast<double>(i);
+                return true;
+            }
+        }
+        char buf[64];
+        std::string big;
+        const char* cstr = nullptr;
+        if (tok.size() < sizeof(buf)) {
+            std::memcpy(buf, tok.data(), tok.size());
+            buf[tok.size()] = '\0';
+            cstr = buf;
+        } else {
+            big.assign(tok);
+            cstr = big.c_str();
         }
         char* end = nullptr;
-        const double d = std::strtod(tok.c_str(), &end);
-        if (end != tok.c_str() + tok.size()) {
+        errno = 0;
+        const double d = std::strtod(cstr, &end);
+        if (end != cstr + tok.size()) {
             fail("invalid number");
-            return std::nullopt;
+            return false;
         }
-        return Value::make_number(d, false, 0);
+        out.is_int_ = false;
+        out.double_ = d;
+        out.int_ = 0;
+        return true;
     }
 
     static void append_utf8(std::string& out, std::uint32_t cp) {
@@ -242,12 +291,16 @@ private:
     bool parse_string(std::string& out) {
         ++pos_;  // opening quote
         while (pos_ < s_.size()) {
+            // Copy the run of ordinary characters in one go.
+            std::size_t run = pos_;
+            while (run < s_.size() && s_[run] != '"' && s_[run] != '\\') ++run;
+            if (run != pos_) {
+                out.append(s_.data() + pos_, run - pos_);
+                pos_ = run;
+                if (pos_ >= s_.size()) break;
+            }
             const char c = s_[pos_++];
             if (c == '"') return true;
-            if (c != '\\') {
-                out.push_back(c);
-                continue;
-            }
             if (pos_ >= s_.size()) break;
             const char e = s_[pos_++];
             switch (e) {
@@ -291,23 +344,81 @@ private:
         return false;
     }
 
-    std::optional<Value> parse_array(int depth) {
+    bool skip_string() {
         ++pos_;
-        Value arr = Value::make_array();
+        while (pos_ < s_.size()) {
+            const char ch = s_[pos_++];
+            if (ch == '\\') {
+                if (pos_ >= s_.size()) break;
+                ++pos_;
+            } else if (ch == '"') {
+                return true;
+            }
+        }
+        fail("unterminated string");
+        return false;
+    }
+
+    bool skip_value(int depth) {
+        if (pos_ >= s_.size()) {
+            fail("unexpected end of input");
+            return false;
+        }
+        const char c = s_[pos_];
+        if (c == '"') return skip_string();
+        if (c != '{' && c != '[') {
+            Value scratch;
+            return parse_value(depth, scratch);
+        }
+        int nest = 0;
+        while (pos_ < s_.size()) {
+            const char ch = s_[pos_];
+            if (ch == '"') {
+                if (!skip_string()) return false;
+                continue;
+            }
+            if (ch == '{' || ch == '[') {
+                if (depth + ++nest > kMaxDepth) {
+                    fail("nesting too deep");
+                    return false;
+                }
+            } else if (ch == '}' || ch == ']') {
+                if (--nest == 0) {
+                    ++pos_;
+                    return true;
+                }
+            }
+            ++pos_;
+        }
+        fail("unterminated value");
+        return false;
+    }
+
+    bool skipped_key(std::string_view key) const {
+        if (opts_ == nullptr) return false;
+        for (const std::string_view k : opts_->skip_keys) {
+            if (k == key) return true;
+        }
+        return false;
+    }
+
+    bool parse_array(int depth, Value& out) {
+        ++pos_;
+        out.type_ = Value::Type::Array;
         skip_ws();
         if (pos_ < s_.size() && s_[pos_] == ']') {
             ++pos_;
-            return arr;
+            return true;
         }
+        out.items_.reserve(4);
         while (true) {
             skip_ws();
-            auto v = parse_value(depth + 1);
-            if (!v) return std::nullopt;
-            arr.push_back(std::move(*v));
+            out.items_.emplace_back();
+            if (!parse_value(depth + 1, out.items_.back())) return false;
             skip_ws();
             if (pos_ >= s_.size()) {
                 fail("unterminated array");
-                return std::nullopt;
+                return false;
             }
             if (s_[pos_] == ',') {
                 ++pos_;
@@ -315,43 +426,71 @@ private:
             }
             if (s_[pos_] == ']') {
                 ++pos_;
-                return arr;
+                return true;
             }
             fail("expected ',' or ']'");
-            return std::nullopt;
+            return false;
         }
     }
 
-    std::optional<Value> parse_object(int depth) {
+    bool parse_object(int depth, Value& out) {
         ++pos_;
-        Value obj = Value::make_object();
+        out.type_ = Value::Type::Object;
         skip_ws();
         if (pos_ < s_.size() && s_[pos_] == '}') {
             ++pos_;
-            return obj;
+            return true;
         }
+        out.items_.reserve(8);
+        out.keys_.reserve(8);
         while (true) {
             skip_ws();
             if (pos_ >= s_.size() || s_[pos_] != '"') {
                 fail("expected object key");
-                return std::nullopt;
+                return false;
             }
             std::string key;
-            if (!parse_string(key)) return std::nullopt;
+            if (!parse_string(key)) return false;
             skip_ws();
             if (pos_ >= s_.size() || s_[pos_] != ':') {
                 fail("expected ':'");
-                return std::nullopt;
+                return false;
             }
             ++pos_;
             skip_ws();
-            auto v = parse_value(depth + 1);
-            if (!v) return std::nullopt;
-            obj.set(std::move(key), std::move(*v));
+            if (skipped_key(key)) {
+                if (!skip_value(depth + 1)) return false;
+                skip_ws();
+                if (pos_ < s_.size() && s_[pos_] == ',') {
+                    ++pos_;
+                    continue;
+                }
+                if (pos_ < s_.size() && s_[pos_] == '}') {
+                    ++pos_;
+                    return true;
+                }
+                fail(pos_ >= s_.size() ? "unterminated object" : "expected ',' or '}'");
+                return false;
+            }
+            // Duplicate keys: the last one wins, as before.
+            std::size_t slot = out.keys_.size();
+            for (std::size_t i = 0; i < out.keys_.size(); ++i) {
+                if (out.keys_[i] == key) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == out.keys_.size()) {
+                out.keys_.push_back(std::move(key));
+                out.items_.emplace_back();
+            } else {
+                out.items_[slot] = Value();
+            }
+            if (!parse_value(depth + 1, out.items_[slot])) return false;
             skip_ws();
             if (pos_ >= s_.size()) {
                 fail("unterminated object");
-                return std::nullopt;
+                return false;
             }
             if (s_[pos_] == ',') {
                 ++pos_;
@@ -359,14 +498,15 @@ private:
             }
             if (s_[pos_] == '}') {
                 ++pos_;
-                return obj;
+                return true;
             }
             fail("expected ',' or '}'");
-            return std::nullopt;
+            return false;
         }
     }
 
     std::string_view s_;
+    const ParseOptions* opts_ = nullptr;
     std::size_t pos_ = 0;
     std::string error_;
 };
@@ -374,7 +514,12 @@ private:
 }
 
 std::optional<Value> parse(std::string_view text, std::string* error) {
-    Parser p(text);
+    detail::Parser p(text);
+    return p.run(error);
+}
+
+std::optional<Value> parse(std::string_view text, std::string* error, const ParseOptions& options) {
+    detail::Parser p(text, &options);
     return p.run(error);
 }
 

@@ -9,6 +9,10 @@
 
 namespace sec::json {
 
+namespace detail {
+class Parser;
+}
+
 // Small read-only JSON document model (enough for rule files and sensor output).
 class Value {
 public:
@@ -51,6 +55,7 @@ public:
     void set(std::string key, Value v);
 
 private:
+    friend class detail::Parser;
     static const Value& null_value();
 
     Type type_ = Type::Null;
@@ -63,7 +68,14 @@ private:
     std::vector<std::string> keys_;
 };
 
+struct ParseOptions {
+    // Object members with one of these keys are skipped without building a Value (they read as
+    // missing). Skipped values are only checked for balanced brackets and terminated strings.
+    std::vector<std::string_view> skip_keys;
+};
+
 // Parses a complete JSON document. On failure returns nullopt and fills *error (if given).
 std::optional<Value> parse(std::string_view text, std::string* error = nullptr);
+std::optional<Value> parse(std::string_view text, std::string* error, const ParseOptions& options);
 
 }

@@ -1,5 +1,6 @@
 #include "cli/behavior_cmd.h"
 
+#include "behavior/agent_config.h"
 #include "behavior/engine.h"
 #include "behavior/es_parser.h"
 #include "behavior/rules.h"
@@ -36,15 +37,18 @@ int run_behavior_replay(int argc, char** argv, int from) {
     std::string rules_path;
     std::string ioc_path;
     bool as_json = false;
+    bool inspect_files = true;
     for (int i = from; i < argc; ++i) {
         const std::string s = argv[i];
         if (s == "--rules" && i + 1 < argc) rules_path = argv[++i];
         else if (s == "--ioc" && i + 1 < argc) ioc_path = argv[++i];
         else if (s == "--json") as_json = true;
+        else if (s == "--no-inspect") inspect_files = false;
         else if (input.empty()) input = s;
     }
     if (input.empty()) {
-        std::fputs("usage: sec-cli behavior-replay <events.jsonl|-> [--rules <file>] [--ioc <file>] [--json]\n", stderr);
+        std::fputs("usage: sec-cli behavior-replay <events.jsonl|-> [--rules <file>] [--ioc <file>] [--json] [--no-inspect]\n",
+                   stderr);
         return 2;
     }
 
@@ -69,6 +73,8 @@ int run_behavior_replay(int argc, char** argv, int from) {
     }
 
     behavior::Engine engine(std::move(rules));
+    // Agent / MCP config files named in the events are read if they exist on this machine.
+    if (inspect_files) engine.set_file_inspector(behavior::inspect_agent_config_file);
     if (!ioc_path.empty()) {
         std::string text;
         std::string err;

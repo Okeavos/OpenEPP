@@ -180,8 +180,11 @@ ParseResult parse_eslogger_line(std::string_view line) {
         while (i < line.size() && (line[i] == ' ' || line[i] == ':')) ++i;
         if (line.compare(i, 5, "false") == 0) return skipped();
     }
+    // Bulky members the parser never reads; skipping them roughly halves the cost of an exec record.
+    static const json::ParseOptions kOpts{{"stat", "parent_audit_token", "responsible_audit_token", "tty", "cwd",
+                                           "thread", "action", "fds", "cdhash", "dyld_exec_path", "script"}};
     std::string perr;
-    const auto doc = json::parse(line, &perr);
+    const auto doc = json::parse(line, &perr, kOpts);
     if (!doc || !doc->is_object()) return error("invalid JSON: " + perr);
 
     const Value& ev = (*doc)["event"];

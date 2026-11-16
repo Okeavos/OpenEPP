@@ -333,7 +333,8 @@ TEST(default_rules_load_and_are_consistent) {
     for (const Rule& r : rs.rules) {
         CHECK(!r.id.empty());
         CHECK(!r.title.empty());
-        CHECK(r.score > 0);
+        // Score-0 rules only mark a process (e.g. "ai_agent"), so they must set a tag.
+        CHECK(r.score > 0 || !r.tag.empty());
     }
     CHECK(default_ruleset().rules.size() == rs.rules.size());
 }

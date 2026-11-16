@@ -27,9 +27,10 @@ void usage() {
         "  sec-cli pe <file>\n"
         "      Dump static PE information.\n"
         "  sec-cli quarantine list|restore <id>|delete <id> [--data-dir <dir>] [--to <path>]\n"
-        "  sec-cli behavior-replay <events.jsonl|-> [--rules <file>] [--ioc <file>] [--json]\n"
+        "  sec-cli behavior-replay <events.jsonl|-> [--rules <file>] [--ioc <file>] [--json] [--no-inspect]\n"
         "      Replay recorded sensor events (eslogger or normalized JSONL) through the behaviour engine.\n"
         "  sec-cli behavior-rules\n"
+        "  sec-cli behavior-bench [--processes N] [--seed S]\n"
         "      Print the built-in behaviour rules as JSON.\n");
 }
 
@@ -194,6 +195,7 @@ int main(int argc, char** argv) {
     const std::string cmd = argv[1];
     if (cmd == "behavior-replay") return run_behavior_replay(argc, argv, 2);
     if (cmd == "behavior-rules") return run_behavior_rules();
+    if (cmd == "behavior-bench") return run_behavior_bench(argc, argv, 2);
     const Args a = parse(argc, argv, 2);
     if (cmd == "scan") return cmd_scan(a);
     if (cmd == "hash") return cmd_hash(a);

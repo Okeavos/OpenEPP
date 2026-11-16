@@ -3,13 +3,38 @@
 #include "common/util.h"
 
 #include <algorithm>
-#include <unordered_set>
+
 
 namespace sec::behavior {
 
 std::string name_of(const std::string& path) {
     const std::size_t slash = path.find_last_of("/\\");
     return util::to_lower(slash == std::string::npos ? path : path.substr(slash + 1));
+}
+
+void ProcNode::refresh_derived() {
+    lpath = util::to_lower(path);
+    if (args.empty()) {
+        lcmd = lpath;
+    } else {
+        std::size_t n = 0;
+        for (const std::string& a : args) n += a.size() + 1;
+        lcmd.clear();
+        lcmd.reserve(n);
+        for (const std::string& a : args) {
+            if (!lcmd.empty()) lcmd.push_back(' ');
+            lcmd += a;
+        }
+        lcmd = util::to_lower(std::move(lcmd));
+    }
+    lteam = util::to_lower(team_id);
+    lsigning = util::to_lower(signing_id);
+    lenv.clear();
+    for (const std::string& e : env) {
+        if (!lenv.empty()) lenv.push_back(' ');
+        lenv += e;
+    }
+    lenv = util::to_lower(std::move(lenv));
 }
 
 namespace {
@@ -29,6 +54,7 @@ void assign_image(ProcNode& n, const ProcessRef& ref, bool with_args) {
         n.platform_binary = ref.platform_binary;
         n.sig_known = true;
     }
+    n.refresh_derived();
 }
 
 }
@@ -59,6 +85,7 @@ ProcNode& ProcessTree::on_exec(const ProcessRef& ref, std::int64_t time_ms) {
         ProcNode& n = it->second;
         assign_image(n, ref, true);
         n.hit_ids.clear();
+        n.hit_bits.clear();
         if (n.ppid == 0) n.ppid = ref.ppid;
         return n;
     }
@@ -108,14 +135,20 @@ const ProcNode* ProcessTree::find(int pid) const {
 
 std::vector<const ProcNode*> ProcessTree::chain(int pid, std::size_t max_depth) const {
     std::vector<const ProcNode*> out;
-    std::unordered_set<int> seen;
+    chain_into(pid, max_depth, out);
+    return out;
+}
+
+void ProcessTree::chain_into(int pid, std::size_t max_depth, std::vector<const ProcNode*>& out) const {
+    out.clear();
     const ProcNode* cur = find(pid);
-    while (cur != nullptr && out.size() < max_depth && seen.insert(cur->pid).second) {
+    while (cur != nullptr && out.size() < max_depth) {
+        // A pid cycle can only come from pid reuse; the chain is short, so a linear check is cheapest.
+        if (std::find(out.begin(), out.end(), cur) != out.end()) break;
         out.push_back(cur);
-        if (cur->ppid <= 0) break;
+        if (cur->ppid <= 0 || cur->ppid == cur->pid) break;
         cur = find(cur->ppid);
     }
-    return out;
 }
 
 void ProcessTree::gc(std::int64_t now_ms) {

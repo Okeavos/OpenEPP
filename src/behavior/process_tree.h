@@ -35,6 +35,17 @@ struct ProcNode {
     std::map<std::string, std::int64_t> tags;  // tag -> last time_ms (inherited)
     std::set<std::string> hit_ids;             // rules that already fired for this image
     std::vector<std::string> hits;             // ordered rule ids (this process only)
+    std::vector<std::uint64_t> hit_bits;       // same as hit_ids, by the engine's rule index
+
+    // Lowercased copies kept in sync with the image fields (see refresh_derived()), so rules don't
+    // lowercase the same strings on every event.
+    std::string lpath;
+    std::string lcmd;  // joined argv, or the path when argv is unknown
+    std::string lteam;
+    std::string lsigning;
+    std::string lenv;
+
+    void refresh_derived();
 
     // Known to be neither an Apple platform binary nor signed by a developer team.
     bool is_unsigned() const { return sig_known && !platform_binary && team_id.empty(); }
@@ -59,6 +70,8 @@ public:
 
     // self first, then ancestors (at most max_depth entries).
     std::vector<const ProcNode*> chain(int pid, std::size_t max_depth = 12) const;
+    // Same, into a caller-owned buffer (no allocation once the buffer has grown).
+    void chain_into(int pid, std::size_t max_depth, std::vector<const ProcNode*>& out) const;
 
     void gc(std::int64_t now_ms);
     std::size_t size() const { return nodes_.size(); }

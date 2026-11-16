@@ -1,0 +1,13 @@
+# Ordinary AI coding agent work: reading code, running tests, git, fetching package metadata, editing files.
+{"type":"exec","time_ms":5000000,"pid":900,"ppid":1,"path":"/bin/zsh","args":["zsh","-l"],"signing":"platform"}
+{"type":"exec","time_ms":5001000,"pid":901,"ppid":900,"path":"/Users/dev/.local/bin/claude","args":["claude"],"signing":"team:Q6L2SF6YDW"}
+{"type":"exec","time_ms":5010000,"pid":910,"ppid":901,"path":"/bin/zsh","args":["zsh","-c","git status && git log --oneline -5"],"signing":"platform"}
+{"type":"exec","time_ms":5010100,"pid":911,"ppid":910,"path":"/usr/bin/git","args":["git","status"],"signing":"platform"}
+{"type":"exec","time_ms":5012000,"pid":912,"ppid":901,"path":"/usr/bin/grep","args":["grep","-rn","parseConfig","src"],"signing":"platform"}
+{"type":"exec","time_ms":5015000,"pid":913,"ppid":901,"path":"/bin/zsh","args":["zsh","-c","npm test"],"signing":"platform"}
+{"type":"exec","time_ms":5015100,"pid":914,"ppid":913,"path":"/usr/local/bin/node","args":["node","/usr/local/bin/npm","test"],"signing":"team:HX7739G8FX"}
+{"type":"exec","time_ms":5020000,"pid":915,"ppid":901,"path":"/usr/bin/curl","args":["curl","-s","https://registry.npmjs.org/zod"],"signing":"platform"}
+{"type":"net","time_ms":5020200,"pid":915,"path":"/usr/bin/curl","remote_ip":"104.16.3.35","remote_port":443,"signing":"platform"}
+{"type":"file_modify","time_ms":5030000,"pid":901,"path":"/Users/dev/.local/bin/claude","file":"/Users/dev/project/src/config.ts","signing":"team:Q6L2SF6YDW"}
+{"type":"file_modify","time_ms":5031000,"pid":901,"path":"/Users/dev/.local/bin/claude","file":"/Users/dev/project/CLAUDE.md","signing":"team:Q6L2SF6YDW"}
+{"type":"file_modify","time_ms":5032000,"pid":901,"path":"/Users/dev/.local/bin/claude","file":"/Users/dev/project/.claude/settings.local.json","signing":"team:Q6L2SF6YDW"}
